@@ -24,3 +24,4 @@ async-graphql-axum = "7"
 chrono.workspace = true
 rust-embed = { version = "8", features = ["axum"] }
 mime_guess = "2"
+sqlx.workspace = true

@@ -448,7 +448,26 @@ async fn publish_discovery(
 }
 
 fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("CMDB_HOST"))
-        .unwrap_or_else(|_| "unknown".into())
+    // Try $HOSTNAME first (most shells export it). Fall back to hostname(1).
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    if let Ok(h) = std::env::var("CMDB_HOST") {
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            gethostname::gethostname()
+                .into_string()
+                .unwrap_or_else(|_| "unknown".into())
+        })
 }

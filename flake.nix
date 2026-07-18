@@ -10,6 +10,8 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        # Single PG with both age + pgvector so all 4 migrations work.
+        pgWithExt = pkgs.postgresql_17.withPackages (p: [ p.age p.pgvector ]);
         rustToolchain = pkgs.rustPlatform.toolchain {
           channel = "stable";
           components = [ "rustfmt" "clippy" "rust-analyzer" ];
@@ -19,15 +21,19 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustToolchain
+            pgWithExt
             sqlx-cli
-            postgresql_17
             docker
             cargo-watch
             cargo-nextest
+            gethostname
           ];
           shellHook = ''
             export DATABASE_URL="postgres://helios:helios@localhost:5432/helios_cmdb"
             export RUST_LOG=info
+            # The pg_ctl / psql binaries live inside the withPackages wrapper;
+            # expose them explicitly so `pg_ctl start` works.
+            export PATH="${pgWithExt}/bin:$PATH"
           '';
         };
 

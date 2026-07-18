@@ -17,33 +17,45 @@ SELECT create_graph('helios');
 SELECT create_vlabel('helios', 'Entity');
 SELECT create_elabel('helios', 'Relation');
 
--- Backfill: sync every existing entity to an :Entity vertex.
--- Note: outer DO uses $age_do$ ... $age_do$ so it doesn't conflict with the
--- inner cypher() dollar-quoting (which uses plain $$).
+-- Backfill entities. NOTE: `|| r.id ||` must be evaluated by PL/pgSQL,
+-- NOT inside the dollar-quoted cypher string. We build the SQL via string
+-- concatenation and EXECUTE it. Using `format('%s', ...)` would also work
+-- but `||` is more explicit here.
 DO $age_do$
-DECLARE
-    r RECORD;
+DECLARE r RECORD;
 BEGIN
     FOR r IN SELECT id::text AS id, namespace, type AS entity_type, name FROM entities LOOP
-        PERFORM * FROM ag_catalog.cypher('helios',
-            $$ CREATE (:Entity {entity_id: '` || r.id || `', namespace: '` || r.namespace || `', type: '` || r.entity_type || `', name: '` || r.name || `'}) $$
-        ) AS (v agtype);
+        EXECUTE 'SELECT * FROM ag_catalog.cypher(''helios'', $$ CREATE (:Entity {entity_id: '''
+                || r.id
+                || ''', namespace: '''
+                || r.namespace
+                || ''', type: '''
+                || r.entity_type
+                || ''', name: '''
+                || r.name
+                || '''}) $$) AS __t(v ag_catalog.agtype)';
     END LOOP;
 END $age_do$;
 
--- Backfill: sync every existing relation to an :Relation edge.
+-- Backfill relations. Same pattern: build SQL via ||, EXECUTE it.
 DO $age_do$
-DECLARE
-    r RECORD;
+DECLARE r RECORD;
 BEGIN
     FOR r IN
         SELECT rel.id::text AS id, rel.namespace, rel.type AS rel_type,
                rel.from_id::text AS from_id, rel.to_id::text AS to_id
           FROM relations rel
     LOOP
-        PERFORM * FROM ag_catalog.cypher('helios',
-            $$ MATCH (a:Entity {entity_id: '` || r.from_id || `'}), (b:Entity {entity_id: '` || r.to_id || `'})
-               CREATE (a)-[:Relation {relation_id: '` || r.id || `', namespace: '` || r.namespace || `', type: '` || r.rel_type || `'}]->(b) $$
-        ) AS (e agtype);
+        EXECUTE 'SELECT * FROM ag_catalog.cypher(''helios'', $$ MATCH (a:Entity) WHERE a.entity_id = '''
+                || r.from_id
+                || ''' MATCH (b:Entity) WHERE b.entity_id = '''
+                || r.to_id
+                || ''' CREATE (a)-[:Relation {relation_id: '''
+                || r.id
+                || ''', namespace: '''
+                || r.namespace
+                || ''', type: '''
+                || r.rel_type
+                || '''}]->(b) $$) AS __t(v ag_catalog.agtype)';
     END LOOP;
 END $age_do$;

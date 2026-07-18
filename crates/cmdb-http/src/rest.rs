@@ -1,35 +1,56 @@
 //! REST API. All routes under `/api/v1/`.
 
 use crate::gql::{schema_for, Schema};
+use crate::metrics::{render, Counters, SharedCounters};
 use crate::ui;
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{header, StatusCode},
+    middleware::{from_fn, Next},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
     Router,
 };
 use cmdb_auth::TokenManager;
 use cmdb_core::entity::{EntityInput, EntityRef};
-use cmdb_core::fact::FactInput;
-use cmdb_core::id::EntityId;
+use cmdb_core::fact::{FactInput, FactQuery};
+use cmdb_core::id::{EntityId, RelationId};
 use cmdb_core::relation::RelationInput;
 use cmdb_core::source::Source;
 use cmdb_core::store::{Direction, QueryFilter, TraverseStep};
 use cmdb_core::Store;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn Store>,
+    pool: Option<sqlx::PgPool>,
     actor: String,
     token_mgr: Option<TokenManager>,
     require_auth: bool,
+    counters: SharedCounters,
+}
+
+impl AppState {
+    async fn check_token(&self, headers: &axum::http::HeaderMap) -> Result<Option<cmdb_auth::Principal>, cmdb_auth::AuthError> {
+        if !self.require_auth {
+            return Ok(None);
+        }
+        let raw = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .ok_or(cmdb_auth::AuthError::Missing)?;
+        let mgr = self.token_mgr.as_ref().ok_or(cmdb_auth::AuthError::Missing)?;
+        Ok(Some(mgr.verify(raw).await?))
+    }
 }
 
 pub async fn run(store: Arc<dyn Store>, actor: String, addr: SocketAddr) -> Result<()> {
@@ -42,12 +63,25 @@ pub async fn run_with_options(
     addr: SocketAddr,
     opts: crate::HttpOptions,
 ) -> Result<()> {
+    run_with_options_and_pool(store, None, actor, addr, opts).await
+}
+
+pub async fn run_with_options_and_pool(
+    store: Arc<dyn Store>,
+    pool: Option<sqlx::PgPool>,
+    actor: String,
+    addr: SocketAddr,
+    opts: crate::HttpOptions,
+) -> Result<()> {
+    let token_mgr = pool.clone().map(TokenManager::new);
     let schema = schema_for(store.clone());
     let state = AppState {
         store: store.clone(),
+        pool,
         actor,
-        token_mgr: None,
+        token_mgr,
         require_auth: opts.require_auth,
+        counters: crate::metrics::shared(),
     };
 
     let api_routes: Router<(AppState, Schema)> = Router::new()
@@ -65,6 +99,7 @@ pub async fn run_with_options(
 
     let mut app: Router<(AppState, Schema)> = Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/graphql/playground", get(playground));
 
     if opts.serve_ui {
@@ -76,14 +111,38 @@ pub async fn run_with_options(
 
     app = app.merge(api_routes);
 
-    let app = app.with_state((state, schema));
+    // Apply auth enforcement as a post-layer if require_auth is on. We use
+    // a closure-capturing Arc<AppState> to avoid the from_fn_with_state
+    // type-inference issues with `State<(AppState, Schema)>`.
+    let shared_for_auth = Arc::new(state.clone());
+    let auth_mw = move |req: axum::extract::Request, next: Next| {
+        let state = shared_for_auth.clone();
+        async move {
+            if !state.require_auth {
+                return next.run(req).await;
+            }
+            match state.check_token(req.headers()).await {
+                Ok(Some(principal)) => {
+                    let mut req = req;
+                    req.extensions_mut().insert(principal);
+                    next.run(req).await
+                }
+                Ok(None) => next.run(req).await,
+                Err(e) => e.into_response(),
+            }
+        }
+    };
+    let app = app
+        .layer(CorsLayer::permissive())
+        .layer(from_fn(auth_mw))
+        .with_state((state, schema));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
         %addr,
         require_auth = opts.require_auth,
         serve_ui = opts.serve_ui,
-        "HTTP server listening (REST + GraphQL + UI)"
+        "HTTP server listening (REST + GraphQL + UI + metrics)"
     );
     axum::serve(listener, app).await?;
     Ok(())
@@ -91,6 +150,20 @@ pub async fn run_with_options(
 
 async fn healthz() -> impl IntoResponse {
     Json(json!({"ok": true, "service": "helios-cmdb", "version": env!("CARGO_PKG_VERSION")}))
+}
+
+async fn metrics(State((s, _)): State<(AppState, Schema)>) -> String {
+    let (entities_count, relations_count) = match &s.pool {
+        Some(pool) => {
+            let e: i64 = sqlx::query_scalar("SELECT count(*) FROM entities")
+                .fetch_one(pool).await.unwrap_or(0);
+            let r: i64 = sqlx::query_scalar("SELECT count(*) FROM relations")
+                .fetch_one(pool).await.unwrap_or(0);
+            (e, r)
+        }
+        None => (0, 0),
+    };
+    render(&s.counters, entities_count, relations_count)
 }
 
 #[derive(Deserialize)]
@@ -312,9 +385,7 @@ async fn delete_relation(
 struct TypeEntry {
     name: &'static str,
     description: &'static str,
-}
-
-async fn list_types(
+}async fn list_types(
     State(_): State<(AppState, Schema)>,
     Query(_): Query<EntityQuery>,
 ) -> Json<Value> {

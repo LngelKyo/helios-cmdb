@@ -12,21 +12,22 @@ use cmdb_core::source::Source;
 use cmdb_core::store::{Direction, QueryFilter, TraverseStep};
 use cmdb_core::Store;
 use cmdb_store_pg::PgStore;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::str::FromStr;
 
 pub async fn dispatch(cli: Cli) -> Result<()> {
     let namespace = cli.namespace.clone();
     let actor = cli.actor.clone();
+    let json_mode = cli.json;
     let store = open_store(&cli).await?;
 
     match cli.command {
         Command::Migrate => migrate(&store).await?,
         Command::PutEntity(args) => put_entity(&namespace, &actor, &store, args).await?,
         Command::Get(args) => get(&store, args).await?,
-        Command::List(args) => list(&namespace, &store, args).await?,
+        Command::List(args) => list(&namespace, &store, args, json_mode).await?,
         Command::Relate(args) => relate(&namespace, &store, args).await?,
-        Command::Query(args) => query(&store, args).await?,
+        Command::Query(args) => query(&store, args, json_mode).await?,
         Command::Serve(args) => serve(&namespace, &actor, &store, args).await?,
         Command::Collector(args) => run_collector(&namespace, &actor, &store, args).await?,
         Command::Tui => {
@@ -35,6 +36,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Token(args) => token_cmd(&store, args).await?,
         Command::Type(args) => type_cmd(&namespace, &actor, &store, args).await?,
+        Command::Stress(args) => stress(&store, args).await?,
     }
     Ok(())
 }
@@ -167,7 +169,7 @@ pub struct ListArgs {
     pub limit: u32,
 }
 
-async fn list(namespace: &str, store: &PgStore, args: ListArgs) -> Result<()> {
+async fn list(namespace: &str, store: &PgStore, args: ListArgs, json_mode: bool) -> Result<()> {
     let mut filter = QueryFilter::new()
         .in_namespace(namespace)
         .with_limit(args.limit);
@@ -179,7 +181,11 @@ async fn list(namespace: &str, store: &PgStore, args: ListArgs) -> Result<()> {
     }
     filter.tags = args.tags;
     let entities = store.query_entities(filter).await?;
-    output::entities(&entities);
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&json!({"entities": entities, "count": entities.len()}))?);
+    } else {
+        output::entities(&entities);
+    }
     Ok(())
 }
 
@@ -238,25 +244,35 @@ pub struct QueryArgs {
     pub cypher: Option<String>,
 }
 
-async fn query(store: &PgStore, args: QueryArgs) -> Result<()> {
+async fn query(store: &PgStore, args: QueryArgs, json_mode: bool) -> Result<()> {
     if let Some(cypher) = &args.cypher {
         let rows = store.cypher(cypher).await?;
+        if json_mode {
+            println!("{}", serde_json::to_string_pretty(&json!({"rows": rows, "count": rows.len()}))?);
+            return Ok(());
+        }
         if rows.is_empty() {
             println!("(no rows)");
             return Ok(());
         }
+        // Compute display widths with ellipsis at 60 chars.
         let cols = rows[0].len();
         let mut widths = vec![0usize; cols];
         for r in &rows {
             for (i, c) in r.iter().enumerate() {
-                widths[i] = widths[i].max(c.len().min(60));
+                let display_len = c.chars().count().min(60);
+                widths[i] = widths[i].max(display_len);
             }
         }
         for r in &rows {
             let cells: Vec<String> = r
                 .iter()
                 .enumerate()
-                .map(|(i, c)| format!("{:<width$}", c.chars().take(60).collect::<String>(), width = widths[i]))
+                .map(|(i, c)| {
+                    let truncated: String = c.chars().take(60).collect();
+                    let suffix = if c.chars().count() > 60 { "…" } else { "" };
+                    format!("{:<width$}", format!("{truncated}{suffix}"), width = widths[i])
+                })
                 .collect();
             println!("{}", cells.join("  |  "));
         }
@@ -310,13 +326,15 @@ pub enum ServeCommand {
     Bus(BusArgs),
     /// REST + GraphQL HTTP server
     Http(HttpArgs),
+    /// PG LISTEN/NOTIFY → NATS change-event bridge
+    Changebus(ChangebusArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct McpArgs {
     #[arg(long, default_value = "stdio")]
     pub transport: String,
-    #[arg(long, default_value = "127.0.0.1:8765")]
+    #[arg(long, default_value = "0.0.0.0:8765")]
     pub addr: String,
 }
 
@@ -332,11 +350,32 @@ pub struct BusArgs {
 
 #[derive(Args, Debug)]
 pub struct HttpArgs {
-    #[arg(long, default_value = "127.0.0.1:8766")]
+    /// Bind address. Default 0.0.0.0 so the UI is reachable from other
+    /// machines on the network; use 127.0.0.1 to restrict to localhost.
+    #[arg(long, default_value = "0.0.0.0:8766")]
     pub addr: String,
+    /// Require Bearer token on /api/v1/* and /graphql routes.
+    #[arg(long, default_value_t = false)]
+    pub require_auth: bool,
+    /// Disable the embedded Web UI (REST/GraphQL only).
+    #[arg(long, default_value_t = false)]
+    pub no_ui: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ChangebusArgs {
+    #[arg(long, env = "CMDB_NATS_URL", default_value = "nats://127.0.0.1:4222")]
+    pub nats_url: String,
+    #[arg(long, env = "CMDB_ANA_PREFIX", default_value = "cc.fleet")]
+    pub prefix: String,
 }
 
 async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -> Result<()> {
+    // Capture pool + db URL before coercing to trait object.
+    let pool = store.pool().clone();
+    let cli_db_url = std::env::var("CMDB_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .map_err(|_| anyhow!("CMDB_DATABASE_URL required for serve"))?;
     let store: std::sync::Arc<dyn Store> = std::sync::Arc::new(store.clone());
     match args.command {
         ServeCommand::Mcp(m) => {
@@ -345,6 +384,7 @@ async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -
                 "stdio" => cmdb_mcp::serve_stdio(store, mcp_actor).await?,
                 "http" => {
                     let addr: std::net::SocketAddr = m.addr.parse()?;
+                    println!("MCP HTTP server on http://{addr}/mcp");
                     cmdb_mcp::serve_http(store, mcp_actor, addr).await?;
                 }
                 other => return Err(anyhow!("unknown transport: {other}")),
@@ -355,7 +395,27 @@ async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -
         }
         ServeCommand::Http(h) => {
             let addr: std::net::SocketAddr = h.addr.parse()?;
-            cmdb_http::run(store, format!("{actor}/http:{namespace}"), addr).await?;
+            let opts = cmdb_http::HttpOptions {
+                require_auth: h.require_auth,
+                serve_ui: !h.no_ui,
+            };
+            println!("helios-cmdb HTTP server starting on http://{addr}");
+            println!("  UI:        http://{addr}/");
+            println!("  REST:      http://{addr}/api/v1/");
+            println!("  GraphQL:   http://{addr}/graphql  (playground at /graphql/playground)");
+            println!("  Metrics:   http://{addr}/metrics");
+            println!("  Health:    http://{addr}/healthz");
+            cmdb_http::run_with_options_and_pool(
+                store,
+                Some(pool),
+                format!("{actor}/http:{namespace}"),
+                addr,
+                opts,
+            ).await?;
+        }
+        ServeCommand::Changebus(c) => {
+            // Convert PG pool URL for tokio-postgres (same format).
+            cmdb_ana_bridge::run_changebus(store, &cli_db_url, &c.nats_url, &c.prefix).await?;
         }
     }
     Ok(())
@@ -426,6 +486,51 @@ async fn run_collector(
             cmdb_collectors::run(&name, store, cfg).await?;
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// stress
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct StressArgs {
+    /// How many entities to insert.
+    #[arg(long, default_value_t = 1000)]
+    pub count: u32,
+    /// Entity type label (defaults to a stress.test type).
+    #[arg(long, default_value = "stress.test")]
+    pub entity_type: String,
+}
+
+async fn stress(store: &PgStore, args: StressArgs) -> Result<()> {
+    let started = std::time::Instant::now();
+    println!("inserting {} entities via generate_series...", args.count);
+    // Use gen_random_uuid() as a per-row suffix to guarantee uniqueness
+    // across re-runs (so we can benchmark repeatedly without manual cleanup).
+    let rows = sqlx::query(
+        r#"INSERT INTO entities (id, namespace, type, name, attrs, tags, created_at, updated_at, version)
+           SELECT gen_random_uuid(),
+                  'cc.fleet',
+                  $1,
+                  'stress-' || g || '-' || substring(gen_random_uuid()::text, 1, 8),
+                  jsonb_build_object('idx', g, 'kind', 'stress'),
+                  ARRAY[]::text[],
+                  NOW(),
+                  NOW(),
+                  1
+             FROM generate_series(1, $2) AS g"#,
+    )
+    .bind(&args.entity_type)
+    .bind(args.count as i64)
+    .execute(store.pool())
+    .await?;
+    println!(
+        "inserted {} rows in {:.2}s ({:.0}/s)",
+        rows.rows_affected(),
+        started.elapsed().as_secs_f64(),
+        rows.rows_affected() as f64 / started.elapsed().as_secs_f64().max(0.001),
+    );
     Ok(())
 }
 

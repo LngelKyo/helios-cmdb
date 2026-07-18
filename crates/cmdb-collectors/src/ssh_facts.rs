@@ -15,7 +15,8 @@ use cmdb_core::source::{Source, SourceKind, Transport};
 use cmdb_core::Store;
 use chrono::Utc;
 use serde_json::{json, Value};
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;pub async fn run(store: Arc<dyn Store>, cfg: CollectorConfig) -> Result<()> {
     if cfg.targets.is_empty() {
@@ -119,6 +120,12 @@ impl HostFacts {
 
 fn ssh_collect(host: &str, user: &str, port: u16) -> Result<HostFacts> {
     let target = format!("{user}@{host}");
+    // The remote login shell may be fish, csh, or anything else — we don't
+    // want our script to be interpreted by it. Instead invoke `sh -s`
+    // explicitly and feed the script via stdin. sh exists on every Linux
+    // and gives us a consistent POSIX shell regardless of the user's login
+    // shell. (Helios runs fish as default; older script via `ssh host
+    // '<script>'` interpreted the script with fish and broke on (..).)
     let script = r####"
 echo "###HOSTNAME###"; hostname
 echo "###UNAME###"; uname -srm
@@ -129,17 +136,25 @@ echo "###DISK###"; df -P / 2>/dev/null | awk 'NR==2 {gsub("%",""); print $5}' ||
 echo "###DOCKER###"; (command -v docker >/dev/null && docker ps --format '{{.Names}}' 2>/dev/null) || true
 "####;
 
-    let output = Command::new("ssh")
+    let mut child = Command::new("ssh")
         .args([
             "-p", &port.to_string(),
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
             "-o", "StrictHostKeyChecking=accept-new",
             &target,
-            script,
+            "sh", "-s",
         ])
-        .output()?;
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(script.as_bytes());
+    }
+
+    let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("ssh failed: {}", stderr.trim()));

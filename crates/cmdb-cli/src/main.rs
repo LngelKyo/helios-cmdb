@@ -37,6 +37,11 @@ pub struct Cli {
     #[arg(long, env = "CMDB_NO_EMBED", global = true, default_value_t = false)]
     pub no_embed: bool,
 
+    /// Output everything as JSON (where supported). Currently affects
+    /// `query --cypher` and `list`.
+    #[arg(long, global = true, default_value_t = false)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -65,6 +70,8 @@ pub enum Command {
     Token(commands::TokenArgs),
     /// Entity-type governance (propose / approve / reject)
     Type(commands::TypeArgs),
+    /// Bulk-insert test entities for load testing (uses generate_series).
+    Stress(commands::StressArgs),
 }
 
 fn main() -> Result<()> {

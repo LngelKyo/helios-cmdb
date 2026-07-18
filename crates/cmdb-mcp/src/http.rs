@@ -34,9 +34,8 @@ pub async fn run(server: McpServer, addr: SocketAddr) -> Result<()> {
         .route("/healthz", get(healthz))
         .route("/mcp", post(handle_mcp))
         .route("/", get(info));
-
+    // Note: addr is logged by the caller; we keep this silent to avoid dup.
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "MCP HTTP server listening");
     axum::serve(listener, app.with_state(AppState { server: state })).await?;
     Ok(())
 }

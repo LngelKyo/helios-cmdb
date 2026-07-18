@@ -1,11 +1,11 @@
-//! helios-cmdb HTTP server: REST + GraphQL + Web UI on one axum router.
+//! helios-cmdb HTTP server: REST + GraphQL + Web UI + metrics on one axum router.
 
 pub mod gql;
+pub mod metrics;
 pub mod rest;
 pub mod ui;
 
 use anyhow::Result;
-use cmdb_auth::TokenManager;
 use cmdb_core::Store;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,4 +35,14 @@ pub async fn run_with(
     opts: HttpOptions,
 ) -> Result<()> {
     rest::run_with_options(store, actor, addr, opts).await
+}
+
+pub async fn run_with_options_and_pool(
+    store: Arc<dyn Store>,
+    pool: Option<sqlx::PgPool>,
+    actor: String,
+    addr: SocketAddr,
+    opts: HttpOptions,
+) -> Result<()> {
+    rest::run_with_options_and_pool(store, pool, actor, addr, opts).await
 }

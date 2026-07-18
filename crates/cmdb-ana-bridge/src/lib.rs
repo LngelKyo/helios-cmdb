@@ -15,8 +15,11 @@
 //! Envelope wire format mirrors ana's Python pydantic models exactly; the
 //! protocol is library-agnostic so we are interoperable.
 
+pub mod bridge;
+pub mod changebus;
 pub mod envelopes;
 pub mod subjects;
-pub mod bridge;
 
 pub use bridge::serve_bus;
+pub use changebus::run as run_changebus;
+

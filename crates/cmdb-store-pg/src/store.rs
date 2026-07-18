@@ -103,51 +103,58 @@ impl PgStore {
 
     /// Dual-write an entity to the AGE graph. Failures are logged but do not
     /// fail the caller — the entities table is the source of truth.
+    ///
+    /// NOTE: AGE 1.7.0-rc0 is missing the `@>` operator that MERGE needs
+    /// for property matching, so we use MATCH-then-CREATE instead. The
+    /// MATCH uses WHERE (not property-pattern) which doesn't trigger @>.
     async fn age_sync_entity(&self, e: &Entity) {
-        let cypher = format!(
-            "MERGE (n:Entity {{entity_id: '{}'}}) SET n.namespace = '{}', n.type = '{}', n.name = '{}'",
-            Self::cypher_escape(&e.id.to_string()),
-            Self::cypher_escape(&e.namespace),
-            Self::cypher_escape(&e.entity_type),
-            Self::cypher_escape(&e.name),
+        let id = Self::cypher_escape(&e.id.to_string());
+        let ns = Self::cypher_escape(&e.namespace);
+        let typ = Self::cypher_escape(&e.entity_type);
+        let name = Self::cypher_escape(&e.name);
+        let del = format!("MATCH (n:Entity) WHERE n.entity_id = '{id}' DETACH DELETE n");
+        let create = format!(
+            "CREATE (n:Entity {{entity_id: '{id}', namespace: '{ns}', type: '{typ}', name: '{name}'}})"
         );
-        if let Err(err) = self.age_query_raw(&cypher).await {
+        if let Err(err) = self.age_query_raw(&del).await {
+            tracing::info!(error = %err, entity_id = %e.id, "AGE pre-delete failed (graph may be empty)");
+        }
+        if let Err(err) = self.age_query_raw(&create).await {
             tracing::warn!(error = %err, entity_id = %e.id, "AGE sync entity failed");
         }
     }
 
     async fn age_delete_entity(&self, id: EntityId) {
-        let cypher = format!(
-            "MATCH (n:Entity {{entity_id: '{}'}}) DETACH DELETE n",
-            Self::cypher_escape(&id.to_string()),
-        );
+        let id_s = Self::cypher_escape(&id.to_string());
+        let cypher = format!("MATCH (n:Entity) WHERE n.entity_id = '{id_s}' DETACH DELETE n");
         if let Err(err) = self.age_query_raw(&cypher).await {
-            tracing::warn!(error = %err, "AGE delete entity failed");
+            tracing::info!(error = %err, "AGE delete entity (graph may be empty)");
         }
     }
 
     async fn age_sync_relation(&self, r: &Relation) {
-        let cypher = format!(
-            "MATCH (a:Entity {{entity_id: '{}'}}), (b:Entity {{entity_id: '{}'}}) \
-             CREATE (a)-[:Relation {{relation_id: '{}', namespace: '{}', type: '{}'}}]->(b)",
-            Self::cypher_escape(&r.from_id.to_string()),
-            Self::cypher_escape(&r.to_id.to_string()),
-            Self::cypher_escape(&r.id.to_string()),
-            Self::cypher_escape(&r.namespace),
-            Self::cypher_escape(&r.relation_type),
+        let from = Self::cypher_escape(&r.from_id.to_string());
+        let to = Self::cypher_escape(&r.to_id.to_string());
+        let rid = Self::cypher_escape(&r.id.to_string());
+        let ns = Self::cypher_escape(&r.namespace);
+        let rt = Self::cypher_escape(&r.relation_type);
+        let del = format!("MATCH ()-[e:Relation]->() WHERE e.relation_id = '{rid}' DELETE e");
+        let create = format!(
+            "MATCH (a:Entity) WHERE a.entity_id = '{from}' \
+             MATCH (b:Entity) WHERE b.entity_id = '{to}' \
+             CREATE (a)-[:Relation {{relation_id: '{rid}', namespace: '{ns}', type: '{rt}'}}]->(b)"
         );
-        if let Err(err) = self.age_query_raw(&cypher).await {
+        let _ = self.age_query_raw(&del).await;
+        if let Err(err) = self.age_query_raw(&create).await {
             tracing::warn!(error = %err, relation_id = %r.id, "AGE sync relation failed");
         }
     }
 
     async fn age_delete_relation(&self, id: RelationId) {
-        let cypher = format!(
-            "MATCH ()-[r:Relation {{relation_id: '{}'}}]->() DELETE r",
-            Self::cypher_escape(&id.to_string()),
-        );
+        let id_s = Self::cypher_escape(&id.to_string());
+        let cypher = format!("MATCH ()-[e:Relation]->() WHERE e.relation_id = '{id_s}' DELETE e");
         if let Err(err) = self.age_query_raw(&cypher).await {
-            tracing::warn!(error = %err, "AGE delete relation failed");
+            tracing::info!(error = %err, "AGE delete relation (graph may be empty)");
         }
     }
 
