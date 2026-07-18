@@ -59,6 +59,8 @@ pub enum Command {
     Serve(commands::ServeArgs),
     /// Run collectors (ssh-facts, k8s_observe, ...)
     Collector(commands::CollectorArgs),
+    /// Interactive TUI browser
+    Tui,
 }
 
 fn main() -> Result<()> {

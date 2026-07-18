@@ -170,6 +170,18 @@ impl McpServer {
                 Ok(json!({"deleted": id.to_string()}))
             }
             "history" => self.tool_history(namespace, &args).await,
+            "cypher" => {
+                let q = args.get("query").and_then(|v| v.as_str()).ok_or("'query' required")?;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+                let rows = self.store.cypher(q).await.map_err(|e| e.to_string())?;
+                let truncated: Vec<&Vec<String>> = rows.iter().take(limit).collect();
+                Ok(json!({
+                    "rows": truncated,
+                    "count": truncated.len(),
+                    "truncated": rows.len() > limit,
+                    "note": "agtype values are JSON-encoded; strings come back quoted",
+                }))
+            }
             other => Err(format!("unknown tool: {other}")),
         };
 
@@ -413,6 +425,11 @@ pub static TOOL_DEFS: &[ToolDef] = &[
         name: "history",
         description: "Append-only change log for the namespace, optionally filtered by entity.",
         input_schema: r#"{"type":"object","properties":{"namespace":{"type":"string"},"entity_id":{"type":"string"},"limit":{"type":"integer","default":20}}}"#,
+    },
+    ToolDef {
+        name: "cypher",
+        description: "Run a Cypher query against the Apache AGE graph (`helios`). Vertices are :Entity {entity_id, namespace, type, name}; edges are :Relation {relation_id, namespace, type}. Returns agtype-encoded values.",
+        input_schema: r#"{"type":"object","required":["query"],"properties":{"query":{"type":"string","description":"e.g. MATCH (a:Entity {type:'fleet.agent'})-[:Relation {type:'runs_on'}]->(h:Entity) RETURN a.name, h.name"},"limit":{"type":"integer","default":50}}}"#,
     },
 ];
 

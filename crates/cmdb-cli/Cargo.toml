@@ -18,6 +18,7 @@ cmdb-mcp.workspace = true
 cmdb-ana-bridge.workspace = true
 cmdb-http.workspace = true
 cmdb-collectors.workspace = true
+cmdb-tui.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 tokio.workspace = true
 serde.workspace = true

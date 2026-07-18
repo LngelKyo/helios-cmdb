@@ -29,6 +29,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Query(args) => query(&store, args).await?,
         Command::Serve(args) => serve(&namespace, &actor, &store, args).await?,
         Command::Collector(args) => run_collector(&namespace, &actor, &store, args).await?,
+        Command::Tui => {
+            let store_arc: std::sync::Arc<dyn Store> = std::sync::Arc::new(store.clone());
+            cmdb_tui::run(store_arc, namespace.clone()).await?;
+        }
     }
     Ok(())
 }
@@ -220,17 +224,45 @@ pub struct QueryArgs {
     #[arg(long)]
     pub traverse: bool,
     #[arg(long)]
-    pub from: String,
+    pub from: Option<String>,
     #[arg(long, default_value_t = 3)]
     pub depth: u32,
     #[arg(long)]
     pub relation_type: Option<String>,
     #[arg(long, default_value = "outgoing")]
     pub direction: String,
+    /// Run a Cypher query against the AGE graph (e.g. "MATCH (n) RETURN n LIMIT 10")
+    #[arg(long)]
+    pub cypher: Option<String>,
 }
 
 async fn query(store: &PgStore, args: QueryArgs) -> Result<()> {
-    let from_id = match parse_ref(&args.from)? {
+    if let Some(cypher) = &args.cypher {
+        let rows = store.cypher(cypher).await?;
+        if rows.is_empty() {
+            println!("(no rows)");
+            return Ok(());
+        }
+        let cols = rows[0].len();
+        let mut widths = vec![0usize; cols];
+        for r in &rows {
+            for (i, c) in r.iter().enumerate() {
+                widths[i] = widths[i].max(c.len().min(60));
+            }
+        }
+        for r in &rows {
+            let cells: Vec<String> = r
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{:<width$}", c.chars().take(60).collect::<String>(), width = widths[i]))
+                .collect();
+            println!("{}", cells.join("  |  "));
+        }
+        println!("\n{} row{}", rows.len(), if rows.len() == 1 { "" } else { "s" });
+        return Ok(());
+    }
+    let from = args.from.as_deref().ok_or_else(|| anyhow!("--from is required (or use --cypher)"))?;
+    let from_id = match parse_ref(from)? {
         EntityRef::Id { id } => id,
         EntityRef::Name {
             namespace,

@@ -65,6 +65,92 @@ impl PgStore {
         Ok(())
     }
 
+    /// Escape a string for safe interpolation into a Cypher single-quoted
+    /// literal. Cypher uses backslash escapes like C.
+    fn cypher_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
+    /// Run a Cypher query against the `helios` AGE graph. Returns each row
+    /// as raw agtype-encoded strings (caller decodes). Cypher queries must
+    /// return a single column; use `RETURN {a: x, b: y}` to bundle multiple.
+    async fn age_query_raw(&self, cypher: &str) -> StoreResult<Vec<Vec<String>>> {
+        let sql = format!(
+            "SELECT (result)::text AS cell FROM ag_catalog.cypher('helios', $$ {} $$) AS __t(result ag_catalog.agtype);",
+            cypher
+        );
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await.map_err(|e| {
+            StoreError::Backend(format!("cypher: {e}"))
+        })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let cell: Option<String> = r.try_get("cell").unwrap_or(None);
+            out.push(vec![cell.unwrap_or_else(|| "null".into())]);
+        }
+        Ok(out)
+    }
+
+    /// Dual-write an entity to the AGE graph. Failures are logged but do not
+    /// fail the caller — the entities table is the source of truth.
+    async fn age_sync_entity(&self, e: &Entity) {
+        let cypher = format!(
+            "MERGE (n:Entity {{entity_id: '{}'}}) SET n.namespace = '{}', n.type = '{}', n.name = '{}'",
+            Self::cypher_escape(&e.id.to_string()),
+            Self::cypher_escape(&e.namespace),
+            Self::cypher_escape(&e.entity_type),
+            Self::cypher_escape(&e.name),
+        );
+        if let Err(err) = self.age_query_raw(&cypher).await {
+            tracing::warn!(error = %err, entity_id = %e.id, "AGE sync entity failed");
+        }
+    }
+
+    async fn age_delete_entity(&self, id: EntityId) {
+        let cypher = format!(
+            "MATCH (n:Entity {{entity_id: '{}'}}) DETACH DELETE n",
+            Self::cypher_escape(&id.to_string()),
+        );
+        if let Err(err) = self.age_query_raw(&cypher).await {
+            tracing::warn!(error = %err, "AGE delete entity failed");
+        }
+    }
+
+    async fn age_sync_relation(&self, r: &Relation) {
+        let cypher = format!(
+            "MATCH (a:Entity {{entity_id: '{}'}}), (b:Entity {{entity_id: '{}'}}) \
+             CREATE (a)-[:Relation {{relation_id: '{}', namespace: '{}', type: '{}'}}]->(b)",
+            Self::cypher_escape(&r.from_id.to_string()),
+            Self::cypher_escape(&r.to_id.to_string()),
+            Self::cypher_escape(&r.id.to_string()),
+            Self::cypher_escape(&r.namespace),
+            Self::cypher_escape(&r.relation_type),
+        );
+        if let Err(err) = self.age_query_raw(&cypher).await {
+            tracing::warn!(error = %err, relation_id = %r.id, "AGE sync relation failed");
+        }
+    }
+
+    async fn age_delete_relation(&self, id: RelationId) {
+        let cypher = format!(
+            "MATCH ()-[r:Relation {{relation_id: '{}'}}]->() DELETE r",
+            Self::cypher_escape(&id.to_string()),
+        );
+        if let Err(err) = self.age_query_raw(&cypher).await {
+            tracing::warn!(error = %err, "AGE delete relation failed");
+        }
+    }
+
     async fn upsert_embedding(&self, entity_id: EntityId, text: &str) {
         let Some(embedder) = &self.embedder else {
             return;
@@ -198,6 +284,9 @@ impl Store for PgStore {
         let text = cmdb_embedding::text_for_entity(&entity);
         self.upsert_embedding(entity.id, &text).await;
 
+        // Dual-write to Apache AGE graph (best-effort).
+        self.age_sync_entity(&entity).await;
+
         self.record_change(ChangeRecord {
             id: ChangeId::new(),
             namespace: &entity.namespace,
@@ -291,6 +380,7 @@ impl Store for PgStore {
             .execute(&self.pool)
             .await
             .map_err(pg_err)?;
+        self.age_delete_entity(id).await;
         Ok(())
     }
 
@@ -324,6 +414,7 @@ impl Store for PgStore {
         .await?;
 
         debug!(relation_id = %relation.id, "upserted relation");
+        self.age_sync_relation(&relation).await;
         Ok(relation)
     }
 
@@ -333,6 +424,7 @@ impl Store for PgStore {
             .execute(&self.pool)
             .await
             .map_err(pg_err)?;
+        self.age_delete_relation(id).await;
         Ok(())
     }
 
@@ -414,6 +506,34 @@ impl Store for PgStore {
                 score: row.get::<f64, _>("score") as f32,
             })
             .collect())
+    }
+
+    async fn cypher(&self, query: &str) -> StoreResult<Vec<Vec<String>>> {
+        // Try the translator first (covers the common patterns without
+        // needing AGE; works against any Postgres).
+        match crate::cypher::translate(query) {
+            Ok((sql, _cols)) => {
+                let rows = sqlx::query(&sql)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| StoreError::Backend(format!("cypher translated: {e}")))?;
+                let mut out = Vec::with_capacity(rows.len());
+                for r in &rows {
+                    let cell: Option<String> = r.try_get("result").unwrap_or(None);
+                    out.push(vec![cell.unwrap_or_else(|| "null".into())]);
+                }
+                Ok(out)
+            }
+            Err(trans_err) => {
+                // Fall back to AGE for patterns the translator doesn't cover.
+                match self.age_query_raw(query).await {
+                    Ok(rows) => Ok(rows),
+                    Err(age_err) => Err(StoreError::Backend(format!(
+                        "translator: {trans_err} | age fallback: {age_err}"
+                    ))),
+                }
+            }
+        }
     }
 
     async fn add_fact(&self, input: FactInput) -> StoreResult<Fact> {

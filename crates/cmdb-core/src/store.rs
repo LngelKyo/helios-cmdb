@@ -150,6 +150,15 @@ pub trait Store: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Run a Cypher query against the backing graph (Apache AGE). Returns
+    /// each row as a vector of raw agtype-encoded strings (caller decodes
+    /// or just displays). Backends without a graph layer return an error.
+    async fn cypher(&self, _query: &str) -> StoreResult<Vec<Vec<String>>> {
+        Err(StoreError::Backend(
+            "this backend has no cypher support".into(),
+        ))
+    }
+
     async fn add_fact(&self, input: FactInput) -> StoreResult<Fact>;
 
     async fn effective_facts(
