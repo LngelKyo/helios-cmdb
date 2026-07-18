@@ -1,0 +1,12 @@
+[package]
+name = "cmdb-tui"
+description = "ratatui-based topology browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cmdb-core.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

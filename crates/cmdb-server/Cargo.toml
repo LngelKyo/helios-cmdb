@@ -1,0 +1,19 @@
+[package]
+name = "cmdb-server"
+description = "Main binary: wires all transports (MCP + NATS + HTTP + collectors)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cmdb-server"
+path = "src/main.rs"
+
+[dependencies]
+cmdb-core.workspace = true
+cmdb-store-pg.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

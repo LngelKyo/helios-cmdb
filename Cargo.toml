@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cmdb-core",
+    "crates/cmdb-store-pg",
+    "crates/cmdb-provenance",
+    "crates/cmdb-ana-bridge",
+    "crates/cmdb-mcp",
+    "crates/cmdb-http",
+    "crates/cmdb-collectors",
+    "crates/cmdb-tui",
+    "crates/cmdb-cli",
+    "crates/cmdb-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["helios"]
+repository = "https://github.com/helios/helios-cmdb"
+
+[workspace.dependencies]
+cmdb-core = { path = "crates/cmdb-core" }
+cmdb-store-pg = { path = "crates/cmdb-store-pg" }
+cmdb-provenance = { path = "crates/cmdb-provenance" }
+cmdb-ana-bridge = { path = "crates/cmdb-ana-bridge" }
+cmdb-mcp = { path = "crates/cmdb-mcp" }
+cmdb-http = { path = "crates/cmdb-http" }
+cmdb-collectors = { path = "crates/cmdb-collectors" }
+cmdb-tui = { path = "crates/cmdb-tui" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+ulid = { version = "1", features = ["uuid", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate",
+] }
+clap = { version = "4", features = ["derive"] }
+async-nats = "0.38"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

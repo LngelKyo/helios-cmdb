@@ -1,0 +1,23 @@
+[package]
+name = "cmdb-cli"
+description = "Command-line interface for helios-cmdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cmdb"
+path = "src/main.rs"
+
+[dependencies]
+cmdb-core.workspace = true
+cmdb-store-pg.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

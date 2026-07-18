@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# local env / secrets
+.env
+.env.*
+!.env.example
+
+# sqlx offline metadata (generated on demand)
+.sqlx/
+
+# editor
+.idea/
+.vscode/
+*.swp

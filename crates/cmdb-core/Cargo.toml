@@ -1,0 +1,19 @@
+[package]
+name = "cmdb-core"
+description = "Domain model and storage traits for helios-cmdb (zero IO)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
