@@ -92,6 +92,7 @@ async fn observe_once(store: &Arc<dyn Store>, cfg: &CollectorConfig, host: &str)
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct DContainer {
     #[serde(default, rename = "ID")]
     id: String,
@@ -122,7 +123,7 @@ fn hostname_or_default() -> String {
         })
 }
 
-fn make_source(cfg: &CollectorConfig, host: &str) -> Source {
+fn make_source(_cfg: &CollectorConfig, host: &str) -> Source {
     Source {
         kind: SourceKind::Collector,
         identity: format!("collector.docker.{}", host),

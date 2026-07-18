@@ -1,6 +1,6 @@
 //! ana bus bridge — main service loop.
 
-use crate::envelopes::{parse_envelope, now_iso, EnvelopeBase, ParsedEnvelope, Query, Reply};
+use crate::envelopes::{parse_envelope, now_iso, EnvelopeBase, ParsedEnvelope, Reply};
 use crate::subjects::SubjectScheme;
 use anyhow::Result;
 use async_nats::Subject;

@@ -9,7 +9,7 @@
 //!   upsertEntity(input), deleteEntity(id), addFact(input),
 //!   addRelation(input), deleteRelation(id)
 
-use async_graphql::{Context, InputObject, InputValueError, Object, Result as GqlResult, SimpleObject};
+use async_graphql::{Context, Object, Result as GqlResult, SimpleObject};
 use cmdb_core::entity::{Entity, EntityInput, EntityRef};
 use cmdb_core::fact::{Fact, FactInput};
 use cmdb_core::id::{EntityId, RelationId};

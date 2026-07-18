@@ -1,7 +1,7 @@
 //! REST API. All routes under `/api/v1/`.
 
 use crate::gql::{schema_for, Schema};
-use crate::metrics::{render, Counters, SharedCounters};
+use crate::metrics::{render, SharedCounters};
 use crate::ui;
 use anyhow::Result;
 use axum::{
@@ -14,8 +14,8 @@ use axum::{
 };
 use cmdb_auth::TokenManager;
 use cmdb_core::entity::{EntityInput, EntityRef};
-use cmdb_core::fact::{FactInput, FactQuery};
-use cmdb_core::id::{EntityId, RelationId};
+use cmdb_core::fact::FactInput;
+use cmdb_core::id::EntityId;
 use cmdb_core::relation::RelationInput;
 use cmdb_core::source::Source;
 use cmdb_core::store::{Direction, QueryFilter, TraverseStep};
@@ -75,13 +75,63 @@ pub async fn run_with_options_and_pool(
 ) -> Result<()> {
     let token_mgr = pool.clone().map(TokenManager::new);
     let schema = schema_for(store.clone());
+    let counters = crate::metrics::shared();
     let state = AppState {
         store: store.clone(),
         pool,
         actor,
         token_mgr,
         require_auth: opts.require_auth,
-        counters: crate::metrics::shared(),
+        counters: counters.clone(),
+    };
+
+    // The auth middleware closure captures a snapshot of state via Arc.
+    // It checks require_auth, then token validity, then per-request scope.
+    let shared_for_auth = Arc::new(state.clone());
+    let auth_mw = move |req: axum::extract::Request, next: Next| {
+        let st = shared_for_auth.clone();
+        async move {
+            // Public routes are always accessible (k8s probes, Prometheus,
+            // Web UI HTML) even under --require-auth.
+            let path = req.uri().path();
+            let is_public = path == "/healthz"
+                || path == "/metrics"
+                || path == "/"
+                || path.starts_with("/ui/")
+                || path == "/graphql/playground";
+            if is_public || !st.require_auth {
+                return next.run(req).await;
+            }
+            match st.check_token(req.headers()).await {
+                Ok(Some(principal)) => {
+                    // Scope enforcement: write methods require 'write' (or
+                    // 'admin'). 'admin' implies 'write' implies 'read'.
+                    // We only check op_scope here; namespace_scope is
+                    // checked in handlers that have access to the request's
+                    // target namespace.
+                    let method = req.method().clone();
+                    let needs_write = method == axum::http::Method::POST
+                        || method == axum::http::Method::PUT
+                        || method == axum::http::Method::DELETE
+                        || method == axum::http::Method::PATCH;
+                    if needs_write
+                        && !principal.op_scope.is_empty()
+                        && !principal.op_scope.contains("write")
+                        && !principal.op_scope.contains("admin")
+                    {
+                        return cmdb_auth::AuthError::Forbidden(
+                            "token lacks 'write' scope".into(),
+                        )
+                        .into_response();
+                    }
+                    let mut req = req;
+                    req.extensions_mut().insert(principal);
+                    next.run(req).await
+                }
+                Ok(None) => next.run(req).await,
+                Err(e) => e.into_response(),
+            }
+        }
     };
 
     let api_routes: Router<(AppState, Schema)> = Router::new()
@@ -109,32 +159,12 @@ pub async fn run_with_options_and_pool(
             .route("/", get(ui::index));
     }
 
-    app = app.merge(api_routes);
-
-    // Apply auth enforcement as a post-layer if require_auth is on. We use
-    // a closure-capturing Arc<AppState> to avoid the from_fn_with_state
-    // type-inference issues with `State<(AppState, Schema)>`.
-    let shared_for_auth = Arc::new(state.clone());
-    let auth_mw = move |req: axum::extract::Request, next: Next| {
-        let state = shared_for_auth.clone();
-        async move {
-            if !state.require_auth {
-                return next.run(req).await;
-            }
-            match state.check_token(req.headers()).await {
-                Ok(Some(principal)) => {
-                    let mut req = req;
-                    req.extensions_mut().insert(principal);
-                    next.run(req).await
-                }
-                Ok(None) => next.run(req).await,
-                Err(e) => e.into_response(),
-            }
-        }
-    };
+    // api_routes gets auth middleware; app (public routes) does not.
+    let api_routes = api_routes.layer(from_fn(auth_mw));
     let app = app
+        .merge(api_routes)
         .layer(CorsLayer::permissive())
-        .layer(from_fn(auth_mw))
+        .layer(from_fn(metrics_middleware(counters.clone())))
         .with_state((state, schema));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -146,6 +176,27 @@ pub async fn run_with_options_and_pool(
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Request counter middleware factory — increments `http_requests_total`
+/// per request and bumps 4xx/5xx counters based on response status.
+fn metrics_middleware(
+    counters: SharedCounters,
+) -> impl Fn(axum::extract::Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> + Clone + 'static {
+    move |req, next| {
+        let c = counters.clone();
+        Box::pin(async move {
+            c.http_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let resp = next.run(req).await;
+            let status = resp.status().as_u16();
+            if status >= 400 && status < 500 {
+                c.http_requests_4xx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if status >= 500 {
+                c.http_requests_5xx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            resp
+        })
+    }
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -167,6 +218,7 @@ async fn metrics(State((s, _)): State<(AppState, Schema)>) -> String {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct EntityQuery {
     #[serde(rename = "type")]
     entity_type: Option<String>,
@@ -212,6 +264,7 @@ async fn list_entities(
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct UpsertEntityBody {
     namespace: Option<String>,
     #[serde(rename = "type")]
@@ -249,6 +302,7 @@ async fn delete_entity(
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ListFactsQuery {
     min_confidence: Option<f32>,
     namespace: Option<String>,
@@ -269,6 +323,7 @@ async fn list_facts(
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct TraverseQuery {
     namespace: Option<String>,
     depth: Option<u32>,
@@ -305,6 +360,7 @@ async fn traverse(
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AddFactBody {
     namespace: Option<String>,
     entity: EntityRef,
@@ -341,6 +397,7 @@ async fn add_fact(
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AddRelationBody {
     namespace: Option<String>,
     from: EntityRef,
@@ -382,6 +439,7 @@ async fn delete_relation(
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 struct TypeEntry {
     name: &'static str,
     description: &'static str,
@@ -532,7 +590,6 @@ impl IntoResponse for AppError {
 }
 
 use std::str::FromStr;
-use async_trait::async_trait;
 #[allow(dead_code)]
 fn _suppress_unused() {
     let _ = BTreeSet::<String>::new();

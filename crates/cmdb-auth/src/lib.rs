@@ -69,9 +69,17 @@ pub struct Principal {
 
 impl Principal {
     pub fn can_read(&self, namespace: &str) -> bool {
+        // admin/write implies read.
+        if self.is_admin() || self.has_op("write") {
+            return self.in_namespace(namespace);
+        }
         self.has_op("read") && self.in_namespace(namespace)
     }
     pub fn can_write(&self, namespace: &str) -> bool {
+        // admin implies write.
+        if self.is_admin() {
+            return self.in_namespace(namespace);
+        }
         self.has_op("write") && self.in_namespace(namespace)
     }
     pub fn is_admin(&self) -> bool {
@@ -99,6 +107,8 @@ pub enum AuthError {
     Expired,
     #[error("token secret mismatch")]
     BadSecret,
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("database error: {0}")]
     Db(String),
 }
@@ -116,6 +126,7 @@ impl IntoResponse for AuthError {
             AuthError::NotFound | AuthError::Revoked | AuthError::Expired | AuthError::BadSecret => {
                 StatusCode::UNAUTHORIZED
             }
+            AuthError::Forbidden(_) => StatusCode::FORBIDDEN,
             AuthError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (code, format!("{{\"error\":\"{}\"}}", self)).into_response()
@@ -321,3 +332,61 @@ fn _avoid_unused() {
     let _: StatusCode = StatusCode::OK;
     let _: Option<Response> = None;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn principal(ops: &[&str], ns: &[&str]) -> Principal {
+        Principal {
+            identity: "test".into(),
+            namespace_scope: ns.iter().map(|s| s.to_string()).collect(),
+            op_scope: ops.iter().map(|s| s.to_string()).collect(),
+            token_id: "t".into(),
+        }
+    }
+
+    #[test]
+    fn empty_scope_is_admin() {
+        // Empty op_scope = all ops; empty ns_scope = all namespaces.
+        let p = principal(&[], &[]);
+        assert!(p.is_admin());
+        assert!(p.can_read("any_ns"));
+        assert!(p.can_write("any_ns"));
+    }
+
+    #[test]
+    fn read_only_cannot_write() {
+        let p = principal(&["read"], &["cc.fleet"]);
+        assert!(p.can_read("cc.fleet"));
+        assert!(!p.can_write("cc.fleet"));
+        assert!(!p.is_admin());
+    }
+
+    #[test]
+    fn write_implies_read() {
+        let p = principal(&["write"], &["cc.fleet"]);
+        // write implies read in the can_read helper (matches intuitive
+        // expectations: if you can write, you can read).
+        assert!(p.can_read("cc.fleet"));
+        assert!(p.can_write("cc.fleet"));
+    }
+
+    #[test]
+    fn admin_implies_everything() {
+        let p = principal(&["admin"], &["cc.fleet"]);
+        assert!(p.is_admin());
+        assert!(p.can_read("cc.fleet"));
+        assert!(p.can_write("cc.fleet"));
+        // admin restricted to ns scope:
+        assert!(!p.can_read("other_ns"));
+    }
+
+    #[test]
+    fn namespace_scope_isolation() {
+        let p = principal(&["read"], &["cc.fleet"]);
+        assert!(p.can_read("cc.fleet"));
+        assert!(!p.can_read("other"));
+    }
+}
+

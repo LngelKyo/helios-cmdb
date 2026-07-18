@@ -51,6 +51,7 @@ pub fn traverse_hits(hits: &[TraverseHit]) {
     println!("\n{} hit{}", hits.len(), if hits.len() == 1 { "" } else { "s" });
 }
 
+#[allow(dead_code)]
 pub fn change_row(c: &Change) {
     println!(
         "{} {:<10} {:<14} by {}",
@@ -65,6 +66,7 @@ pub fn change_row(c: &Change) {
     }
 }
 
+#[allow(dead_code)]
 fn trim_json(v: &Value, max: usize) -> String {
     let s = serde_json::to_string(v).unwrap_or_default();
     if s.len() > max {
@@ -74,6 +76,7 @@ fn trim_json(v: &Value, max: usize) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn kv(label: &str, value: impl std::fmt::Display) {
     println!("{:<14} {}", format!("{label}:"), value);
 }

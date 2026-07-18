@@ -328,6 +328,9 @@ pub enum ServeCommand {
     Http(HttpArgs),
     /// PG LISTEN/NOTIFY → NATS change-event bridge
     Changebus(ChangebusArgs),
+    /// Run HTTP + bus + changebus in one process (MCP-stdio excluded;
+    /// use `serve mcp` separately since it owns stdin).
+    All(AllArgs),
 }
 
 #[derive(Args, Debug)]
@@ -368,6 +371,25 @@ pub struct ChangebusArgs {
     pub nats_url: String,
     #[arg(long, env = "CMDB_ANA_PREFIX", default_value = "cc.fleet")]
     pub prefix: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AllArgs {
+    /// HTTP bind addr.
+    #[arg(long, default_value = "0.0.0.0:8766")]
+    pub http_addr: String,
+    /// NATS URL for ana bridge + changebus.
+    #[arg(long, env = "CMDB_NATS_URL", default_value = "nats://127.0.0.1:4222")]
+    pub nats_url: String,
+    /// ana bus identity (cc.fleet.<identity>).
+    #[arg(long, default_value = "cmdb")]
+    pub identity: String,
+    /// ana prefix.
+    #[arg(long, env = "CMDB_ANA_PREFIX", default_value = "cc.fleet")]
+    pub prefix: String,
+    /// Require Bearer token on /api/v1/* and /graphql routes.
+    #[arg(long, default_value_t = false)]
+    pub require_auth: bool,
 }
 
 async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -> Result<()> {
@@ -414,8 +436,47 @@ async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -
             ).await?;
         }
         ServeCommand::Changebus(c) => {
-            // Convert PG pool URL for tokio-postgres (same format).
+            // Convert PG pool URL for sqlx PgListener (same format).
             cmdb_ana_bridge::run_changebus(store, &cli_db_url, &c.nats_url, &c.prefix).await?;
+        }
+        ServeCommand::All(a) => {
+            let http_addr: std::net::SocketAddr = a.http_addr.parse()?;
+            let opts = cmdb_http::HttpOptions {
+                require_auth: a.require_auth,
+                serve_ui: true,
+            };
+            println!("helios-cmdb `serve all` starting");
+            println!("  HTTP / UI:  http://{http_addr}/");
+            println!("  ana bus:   identity={} prefix={}", a.identity, a.prefix);
+            println!("  changebus: {} → NATS {}", cli_db_url, a.nats_url);
+
+            // Spawn bus + changebus as background tasks; HTTP runs in foreground.
+            let store_bus = store.clone();
+            let store_cb = store.clone();
+            let bus_id = a.identity.clone();
+            let bus_prefix = a.prefix.clone();
+            let nats_url_bus = a.nats_url.clone();
+            let nats_url_cb = a.nats_url.clone();
+            let db_url = cli_db_url.clone();
+            let cb_prefix = a.prefix.clone();
+            tokio::spawn(async move {
+                if let Err(e) = cmdb_ana_bridge::serve_bus(store_bus, &nats_url_bus, &bus_id, &bus_prefix).await {
+                    tracing::error!(error = %e, "ana bus task exited");
+                }
+            });
+            tokio::spawn(async move {
+                if let Err(e) = cmdb_ana_bridge::run_changebus(store_cb, &db_url, &nats_url_cb, &cb_prefix).await {
+                    tracing::error!(error = %e, "changebus task exited");
+                }
+            });
+
+            cmdb_http::run_with_options_and_pool(
+                store,
+                Some(pool),
+                format!("{actor}/http:{namespace}"),
+                http_addr,
+                opts,
+            ).await?;
         }
     }
     Ok(())

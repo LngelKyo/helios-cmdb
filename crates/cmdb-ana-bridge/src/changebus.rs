@@ -8,7 +8,7 @@
 //! real-time CMDB change notifications.
 
 use anyhow::Result;
-use async_nats::{Client, Subject};
+use async_nats::Subject;
 use cmdb_core::Store;
 use sqlx::postgres::PgListener;
 use std::sync::Arc;

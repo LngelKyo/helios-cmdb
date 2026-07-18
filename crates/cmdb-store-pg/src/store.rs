@@ -5,7 +5,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cmdb_core::change::{Change, ChangeOp};
-use cmdb_core::entity::{Entity, EntityInput, EntityRef};
+use cmdb_core::entity::{Entity, EntityInput};
+#[allow(unused_imports)]
 use cmdb_core::error::{StoreError, StoreResult};
 use cmdb_core::fact::{Fact, FactInput, FactQuery};
 use cmdb_core::id::{ChangeId, EntityId, FactId, RelationId};
@@ -26,11 +27,42 @@ pub struct PgStore {
     embedder: Option<Arc<dyn Embedder>>,
 }
 
+/// Name of the Apache AGE graph used by helios-cmdb.
+///
+/// Historical note: we used to call this `helios`, but that collided with
+/// the typical DB username `helios` (AGE creates a same-named schema for
+/// each graph). Renamed to `cmdb_graph` to avoid the collision.
+pub const GRAPH_NAME: &str = "cmdb_graph";
+
+/// Inject `options=-c search_path=public,ag_catalog` into a Postgres URL
+/// if not already present. This is CRITICAL for two reasons:
+///   1. AGE's `agtype` operator class lives in `ag_catalog`; without it in
+///      search_path, MERGE / WHERE on agtype columns fails with misleading
+///      "operator does not exist" errors (was previously misdiagnosed as
+///      an AGE 1.7.0-rc0 bug — the bug was actually here).
+///   2. The AGE graph creates a same-named schema; if that schema wins
+///      search_path precedence (because it sorts before `public`), new
+///      `_sqlx_migrations` rows land in the wrong schema and subsequent
+///      `migrate` runs lose track of state.
+/// Setting `public` first keeps our tables where we expect them.
+pub fn normalize_pg_url(url: &str) -> String {
+    const OPTS_ENCODED: &str = "options=-c%20search_path%3Dpublic%2Cag_catalog";
+    if url.contains("options=") {
+        return url.to_string();
+    }
+    if url.contains('?') {
+        format!("{url}&{OPTS_ENCODED}")
+    } else {
+        format!("{url}?{OPTS_ENCODED}")
+    }
+}
+
 impl PgStore {
     pub async fn connect(url: &str) -> Result<Self> {
+        let url = normalize_pg_url(url);
         let pool = PgPoolOptions::new()
             .max_connections(8)
-            .connect(url)
+            .connect(&url)
             .await?;
         Ok(Self { pool, embedder: None })
     }
@@ -82,12 +114,12 @@ impl PgStore {
         out
     }
 
-    /// Run a Cypher query against the `helios` AGE graph. Returns each row
-    /// as raw agtype-encoded strings (caller decodes). Cypher queries must
-    /// return a single column; use `RETURN {a: x, b: y}` to bundle multiple.
+    /// Run a Cypher query against the `cmdb_graph` AGE graph. Returns each
+    /// row as raw agtype-encoded strings (caller decodes). Cypher queries
+    /// must return a single column; use `RETURN {a: x, b: y}` to bundle.
     async fn age_query_raw(&self, cypher: &str) -> StoreResult<Vec<Vec<String>>> {
         let sql = format!(
-            "SELECT (result)::text AS cell FROM ag_catalog.cypher('helios', $$ {} $$) AS __t(result ag_catalog.agtype);",
+            "SELECT (result)::text AS cell FROM ag_catalog.cypher('{GRAPH_NAME}', $$ {} $$) AS __t(result ag_catalog.agtype);",
             cypher
         );
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await.map_err(|e| {
@@ -104,55 +136,54 @@ impl PgStore {
     /// Dual-write an entity to the AGE graph. Failures are logged but do not
     /// fail the caller — the entities table is the source of truth.
     ///
-    /// NOTE: AGE 1.7.0-rc0 is missing the `@>` operator that MERGE needs
-    /// for property matching, so we use MATCH-then-CREATE instead. The
-    /// MATCH uses WHERE (not property-pattern) which doesn't trigger @>.
+    /// Uses MERGE with property matching — works correctly when the
+    /// connection's search_path includes ag_catalog (see `normalize_pg_url`).
+    /// entity_id is the UUID-form string to match what migration 0003's
+    /// backfill writes (`r.id::text` on a UUID column).
+    ///
+    /// NOTE: AGE 1.7.0-rc0 doesn't support `ON CREATE SET` / `ON MATCH SET`
+    /// spec syntax — use plain `SET` which applies unconditionally.
     async fn age_sync_entity(&self, e: &Entity) {
-        let id = Self::cypher_escape(&e.id.to_string());
+        let id = Self::cypher_escape(&e.id.as_uuid().to_string());
         let ns = Self::cypher_escape(&e.namespace);
         let typ = Self::cypher_escape(&e.entity_type);
         let name = Self::cypher_escape(&e.name);
-        let del = format!("MATCH (n:Entity) WHERE n.entity_id = '{id}' DETACH DELETE n");
-        let create = format!(
-            "CREATE (n:Entity {{entity_id: '{id}', namespace: '{ns}', type: '{typ}', name: '{name}'}})"
+        let cypher = format!(
+            "MERGE (n:Entity {{entity_id: '{id}'}}) \
+             SET n.namespace = '{ns}', n.type = '{typ}', n.name = '{name}'"
         );
-        if let Err(err) = self.age_query_raw(&del).await {
-            tracing::info!(error = %err, entity_id = %e.id, "AGE pre-delete failed (graph may be empty)");
-        }
-        if let Err(err) = self.age_query_raw(&create).await {
+        if let Err(err) = self.age_query_raw(&cypher).await {
             tracing::warn!(error = %err, entity_id = %e.id, "AGE sync entity failed");
         }
     }
 
     async fn age_delete_entity(&self, id: EntityId) {
-        let id_s = Self::cypher_escape(&id.to_string());
-        let cypher = format!("MATCH (n:Entity) WHERE n.entity_id = '{id_s}' DETACH DELETE n");
+        let id_s = Self::cypher_escape(&id.as_uuid().to_string());
+        let cypher = format!("MATCH (n:Entity {{entity_id: '{id_s}'}}) DETACH DELETE n");
         if let Err(err) = self.age_query_raw(&cypher).await {
             tracing::info!(error = %err, "AGE delete entity (graph may be empty)");
         }
     }
 
     async fn age_sync_relation(&self, r: &Relation) {
-        let from = Self::cypher_escape(&r.from_id.to_string());
-        let to = Self::cypher_escape(&r.to_id.to_string());
-        let rid = Self::cypher_escape(&r.id.to_string());
+        let from = Self::cypher_escape(&r.from_id.as_uuid().to_string());
+        let to = Self::cypher_escape(&r.to_id.as_uuid().to_string());
+        let rid = Self::cypher_escape(&r.id.as_uuid().to_string());
         let ns = Self::cypher_escape(&r.namespace);
         let rt = Self::cypher_escape(&r.relation_type);
-        let del = format!("MATCH ()-[e:Relation]->() WHERE e.relation_id = '{rid}' DELETE e");
-        let create = format!(
-            "MATCH (a:Entity) WHERE a.entity_id = '{from}' \
-             MATCH (b:Entity) WHERE b.entity_id = '{to}' \
-             CREATE (a)-[:Relation {{relation_id: '{rid}', namespace: '{ns}', type: '{rt}'}}]->(b)"
+        let cypher = format!(
+            "MATCH (a:Entity {{entity_id: '{from}'}}), (b:Entity {{entity_id: '{to}'}}) \
+             MERGE (a)-[rel:Relation {{relation_id: '{rid}'}}]->(b) \
+             SET rel.namespace = '{ns}', rel.type = '{rt}'"
         );
-        let _ = self.age_query_raw(&del).await;
-        if let Err(err) = self.age_query_raw(&create).await {
+        if let Err(err) = self.age_query_raw(&cypher).await {
             tracing::warn!(error = %err, relation_id = %r.id, "AGE sync relation failed");
         }
     }
 
     async fn age_delete_relation(&self, id: RelationId) {
-        let id_s = Self::cypher_escape(&id.to_string());
-        let cypher = format!("MATCH ()-[e:Relation]->() WHERE e.relation_id = '{id_s}' DELETE e");
+        let id_s = Self::cypher_escape(&id.as_uuid().to_string());
+        let cypher = format!("MATCH ()-[rel:Relation {{relation_id: '{id_s}'}}]->() DELETE rel");
         if let Err(err) = self.age_query_raw(&cypher).await {
             tracing::info!(error = %err, "AGE delete relation (graph may be empty)");
         }
@@ -203,7 +234,7 @@ struct ChangeRecord<'a> {
 }
 
 fn pg_err(e: sqlx::Error) -> StoreError {
-    use sqlx::error::DatabaseError;
+
     match &e {
         sqlx::Error::RowNotFound => StoreError::NotFound("row".into()),
         sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -336,6 +367,7 @@ impl Store for PgStore {
         Ok(row.as_ref().map(map_entity))
     }
 
+#[allow(unused_assignments)]
     async fn query_entities(&self, filter: QueryFilter) -> StoreResult<Vec<Entity>> {
         let mut sql = String::from(
             r#"SELECT id, namespace, type AS entity_type, name, attrs, tags,

@@ -197,7 +197,7 @@ fn parse_facts(stdout: &str) -> HostFacts {
     f
 }
 
-fn make_source(cfg: &CollectorConfig, host: &str) -> Source {
+fn make_source(_cfg: &CollectorConfig, host: &str) -> Source {
     Source {
         kind: SourceKind::Collector,
         identity: format!("collector.ssh-facts.{}", host),

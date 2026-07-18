@@ -226,7 +226,7 @@ impl Store for InMemoryStore {
             .get(&from)
             .ok_or_else(|| StoreError::NotFound(format!("entity {from}")))?;
         let start_ns = start.namespace.clone();
-        drop(start);
+        let _ = &start;
 
         let mut visited: BTreeSet<EntityId> = BTreeSet::from([from]);
         let mut frontier: Vec<(EntityId, u32, Vec<EntityId>)> = vec![(from, 0, vec![from])];
