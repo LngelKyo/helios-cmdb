@@ -38,7 +38,13 @@ async fn open_store(cli: &Cli) -> Result<PgStore> {
         .database_url
         .as_ref()
         .ok_or_else(|| anyhow!("--database-url or CMDB_DATABASE_URL is required"))?;
-    PgStore::connect(url).await
+    let mut store = PgStore::connect(url).await?;
+    if !cli.no_embed {
+        let embedder: std::sync::Arc<dyn cmdb_embedding::Embedder> =
+            std::sync::Arc::from(cmdb_embedding::from_env());
+        store = store.with_embedder(embedder);
+    }
+    Ok(store)
 }
 
 async fn migrate(store: &PgStore) -> Result<()> {
@@ -268,6 +274,8 @@ pub enum ServeCommand {
     Mcp(McpArgs),
     /// Subscribe to cc.fleet.> and serve cmdb.query.> RPC over the ana bus
     Bus(BusArgs),
+    /// REST + GraphQL HTTP server
+    Http(HttpArgs),
 }
 
 #[derive(Args, Debug)]
@@ -288,12 +296,16 @@ pub struct BusArgs {
     pub prefix: String,
 }
 
+#[derive(Args, Debug)]
+pub struct HttpArgs {
+    #[arg(long, default_value = "127.0.0.1:8766")]
+    pub addr: String,
+}
+
 async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -> Result<()> {
     let store: std::sync::Arc<dyn Store> = std::sync::Arc::new(store.clone());
     match args.command {
         ServeCommand::Mcp(m) => {
-            // Actor tag for writes coming through MCP — carries the namespace
-            // and configurable actor id so provenance is traceable.
             let mcp_actor = format!("{actor}/mcp:{namespace}");
             match m.transport.as_str() {
                 "stdio" => cmdb_mcp::serve_stdio(store, mcp_actor).await?,
@@ -306,6 +318,10 @@ async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -
         }
         ServeCommand::Bus(b) => {
             cmdb_ana_bridge::serve_bus(store, &b.nats_url, &b.identity, &b.prefix).await?;
+        }
+        ServeCommand::Http(h) => {
+            let addr: std::net::SocketAddr = h.addr.parse()?;
+            cmdb_http::run(store, format!("{actor}/http:{namespace}"), addr).await?;
         }
     }
     Ok(())

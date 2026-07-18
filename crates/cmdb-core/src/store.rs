@@ -82,6 +82,13 @@ pub struct TraverseHit {
     pub via_relation_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorSearchHit {
+    pub entity: Entity,
+    /// Similarity score in [0, 1] — higher is more similar (1 - cosine_distance).
+    pub score: f32,
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     fn name(&self) -> &'static str {
@@ -129,6 +136,19 @@ pub trait Store: Send + Sync {
     async fn delete_relation(&self, id: RelationId) -> StoreResult<()>;
 
     async fn traverse(&self, from: EntityId, step: TraverseStep) -> StoreResult<Vec<TraverseHit>>;
+
+    /// Semantic similarity search over entity embeddings. Backends without
+    /// an embedder configured should return an empty Vec and the caller can
+    /// fall back to substring search.
+    async fn vector_search(
+        &self,
+        query_text: &str,
+        namespace: &str,
+        limit: u32,
+    ) -> StoreResult<Vec<VectorSearchHit>> {
+        let _ = (query_text, namespace, limit);
+        Ok(Vec::new())
+    }
 
     async fn add_fact(&self, input: FactInput) -> StoreResult<Fact>;
 

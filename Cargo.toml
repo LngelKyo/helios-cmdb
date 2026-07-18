@@ -4,6 +4,7 @@ members = [
     "crates/cmdb-core",
     "crates/cmdb-store-pg",
     "crates/cmdb-provenance",
+    "crates/cmdb-embedding",
     "crates/cmdb-ana-bridge",
     "crates/cmdb-mcp",
     "crates/cmdb-http",
@@ -24,11 +25,18 @@ repository = "https://github.com/helios/helios-cmdb"
 cmdb-core = { path = "crates/cmdb-core" }
 cmdb-store-pg = { path = "crates/cmdb-store-pg" }
 cmdb-provenance = { path = "crates/cmdb-provenance" }
+cmdb-embedding = { path = "crates/cmdb-embedding" }
 cmdb-ana-bridge = { path = "crates/cmdb-ana-bridge" }
 cmdb-mcp = { path = "crates/cmdb-mcp" }
 cmdb-http = { path = "crates/cmdb-http" }
 cmdb-collectors = { path = "crates/cmdb-collectors" }
 cmdb-tui = { path = "crates/cmdb-tui" }
+
+pgvector = { version = "0.4", features = ["sqlx"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
+async-graphql = "7"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+futures-util = "0.3"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -48,8 +56,6 @@ clap = { version = "4", features = ["derive"] }
 async-nats = "0.38"
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
-futures-util = "0.3"
 
 [profile.release]
 opt-level = 3

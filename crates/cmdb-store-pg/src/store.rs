@@ -11,18 +11,19 @@ use cmdb_core::fact::{Fact, FactInput, FactQuery};
 use cmdb_core::id::{ChangeId, EntityId, FactId, RelationId};
 use cmdb_core::relation::{Relation, RelationInput};
 use cmdb_core::source::Source;
-use cmdb_core::store::{Direction, QueryFilter, TraverseHit, TraverseStep};
+use cmdb_core::store::{Direction, QueryFilter, TraverseHit, TraverseStep, VectorSearchHit};
 use cmdb_core::Store;
+use cmdb_embedding::Embedder;
 use serde_json::Value;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
-use std::collections::BTreeSet;
-use std::str::FromStr;
+use std::sync::Arc;
 use tracing::debug;
 
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl PgStore {
@@ -31,7 +32,12 @@ impl PgStore {
             .max_connections(8)
             .connect(url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self { pool, embedder: None })
+    }
+
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -57,6 +63,37 @@ impl PgStore {
             .await
             .map_err(pg_err)?;
         Ok(())
+    }
+
+    async fn upsert_embedding(&self, entity_id: EntityId, text: &str) {
+        let Some(embedder) = &self.embedder else {
+            return;
+        };
+        match embedder.embed(text).await {
+            Ok(vec) => {
+                let pv = pgvector::Vector::from(vec);
+                let sql = r#"
+                    INSERT INTO entity_embeddings (entity_id, embedding, model)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (entity_id) DO UPDATE
+                      SET embedding = EXCLUDED.embedding,
+                          model = EXCLUDED.model,
+                          embedded_at = NOW()
+                "#;
+                if let Err(e) = sqlx::query(sql)
+                    .bind(entity_id.as_uuid())
+                    .bind(pv)
+                    .bind(embedder.name())
+                    .execute(&self.pool)
+                    .await
+                {
+                    tracing::warn!(error = %e, "embedding upsert failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "embedding failed; entity will not be searchable via vector");
+            }
+        }
     }
 }
 
@@ -156,6 +193,10 @@ impl Store for PgStore {
             .await
             .map_err(pg_err)?;
         let entity = map_entity(&row);
+
+        // Compute + persist embedding (no-op if embedder is unconfigured).
+        let text = cmdb_embedding::text_for_entity(&entity);
+        self.upsert_embedding(entity.id, &text).await;
 
         self.record_change(ChangeRecord {
             id: ChangeId::new(),
@@ -333,6 +374,48 @@ impl Store for PgStore {
         Ok(hits)
     }
 
+    async fn vector_search(
+        &self,
+        query_text: &str,
+        namespace: &str,
+        limit: u32,
+    ) -> StoreResult<Vec<VectorSearchHit>> {
+        let Some(embedder) = &self.embedder else {
+            return Ok(Vec::new());
+        };
+        let vec = embedder
+            .embed(query_text)
+            .await
+            .map_err(|e| StoreError::Backend(format!("embed: {e}")))?;
+        let pv = pgvector::Vector::from(vec);
+
+        let sql = r#"
+            SELECT e.id, e.namespace, e.type AS entity_type, e.name, e.attrs, e.tags,
+                   e.created_at, e.updated_at, e.version,
+                   1 - (ee.embedding <=> $1) AS score
+              FROM entity_embeddings ee
+              JOIN entities e ON e.id = ee.entity_id
+             WHERE e.namespace = $2
+             ORDER BY ee.embedding <=> $1
+             LIMIT $3
+        "#;
+        let rows = sqlx::query(sql)
+            .bind(pv)
+            .bind(namespace)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(pg_err)?;
+
+        Ok(rows
+            .iter()
+            .map(|row| VectorSearchHit {
+                entity: map_entity(row),
+                score: row.get::<f64, _>("score") as f32,
+            })
+            .collect())
+    }
+
     async fn add_fact(&self, input: FactInput) -> StoreResult<Fact> {
         let entity = self.resolve_ref(&input.namespace, &input.entity).await?;
         let id = FactId::new();
@@ -435,12 +518,6 @@ impl Store for PgStore {
         }
         Ok(out)
     }
-}
-
-#[allow(dead_code)]
-fn _unused_marker() {
-    let _ = EntityId::from_str("01J0000000000000000000000");
-    let _: BTreeSet<String> = BTreeSet::new();
 }
 
 #[cfg(test)]

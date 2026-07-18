@@ -33,6 +33,10 @@ pub struct Cli {
     #[arg(long, env = "CMDB_ACTOR", global = true, default_value = "user:cli")]
     pub actor: String,
 
+    /// Disable semantic embedding (skip embedder init; vector search returns empty).
+    #[arg(long, env = "CMDB_NO_EMBED", global = true, default_value_t = false)]
+    pub no_embed: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

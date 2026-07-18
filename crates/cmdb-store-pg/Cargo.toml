@@ -8,7 +8,9 @@ authors.workspace = true
 
 [dependencies]
 cmdb-core.workspace = true
+cmdb-embedding.workspace = true
 sqlx.workspace = true
+pgvector.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

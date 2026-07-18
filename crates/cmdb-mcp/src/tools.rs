@@ -268,8 +268,25 @@ impl McpServer {
     }
 
     async fn tool_search(&self, namespace: &str, q: &str, limit: u32) -> Result<Value, String> {
-        // P1 fallback: simple name-prefix search via Store::query_entities.
-        // P2 will add pgvector semantic search over attrs + description.
+        // Try pgvector semantic search first; falls back to substring if no
+        // embedder configured or store returns nothing.
+        let hits = self
+            .store
+            .vector_search(q, namespace, limit)
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap_or_default();
+        if !hits.is_empty() {
+            return Ok(json!({
+                "results": hits.iter().map(|h| json!({
+                    "entity": h.entity,
+                    "score": h.score,
+                })).collect::<Vec<_>>(),
+                "count": hits.len(),
+                "mode": "semantic",
+            }));
+        }
+        // Substring fallback.
         let filter = QueryFilter::new().in_namespace(namespace).with_limit(limit);
         let all = self.store.query_entities(filter).await.map_err(|e| e.to_string())?;
         let q_lower = q.to_lowercase();
@@ -281,7 +298,12 @@ impl McpServer {
                     || e.tags.iter().any(|t| t.to_lowercase().contains(&q_lower))
             })
             .collect();
-        Ok(json!({ "results": filtered, "count": filtered.len() }))
+        Ok(json!({
+            "results": filtered,
+            "count": filtered.len(),
+            "mode": "substring",
+            "hint": "set CMDB_OLLAMA_URL or OPENAI_API_KEY for semantic search",
+        }))
     }
 
     async fn tool_traverse(&self, namespace: &str, args: &Value) -> Result<Value, String> {
