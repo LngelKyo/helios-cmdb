@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 cmdb-core.workspace = true
 cmdb-store-pg.workspace = true
+cmdb-mcp.workspace = true
+cmdb-ana-bridge.workspace = true
+cmdb-collectors.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 tokio.workspace = true
 serde.workspace = true

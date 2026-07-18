@@ -8,6 +8,12 @@
 //!   cmdb relate <from> <type> <to>        create relation
 //!   cmdb query --traverse --from <id>     graph traversal
 //!   cmdb list --type T                    list entities
+//!
+//! P1 commands:
+//!   cmdb serve mcp --transport stdio      MCP server (for Claude Code etc.)
+//!   cmdb serve mcp --transport http --addr 0.0.0.0:8765
+//!   cmdb serve bus                        subscribe to cc.fleet.> and serve RPC
+//!   cmdb collector run ssh-facts --target host1,host2
 
 mod commands;
 mod output;
@@ -19,16 +25,16 @@ use clap::{Parser, Subcommand};
 #[command(name = "cmdb", version, about = "helios-cmdb CLI", long_about = None)]
 pub struct Cli {
     #[arg(long, env = "CMDB_DATABASE_URL", global = true)]
-    database_url: Option<String>,
+    pub database_url: Option<String>,
 
     #[arg(long, env = "CMDB_NAMESPACE", global = true, default_value = "cc.fleet")]
-    namespace: String,
+    pub namespace: String,
 
     #[arg(long, env = "CMDB_ACTOR", global = true, default_value = "user:cli")]
-    actor: String,
+    pub actor: String,
 
     #[command(subcommand)]
-    command: Command,
+    pub command: Command,
 }
 
 #[derive(Subcommand, Debug)]
@@ -45,6 +51,10 @@ pub enum Command {
     Relate(commands::RelateArgs),
     /// Run a graph traversal from an entity
     Query(commands::QueryArgs),
+    /// Run a server (MCP, ana bus, ...)
+    Serve(commands::ServeArgs),
+    /// Run collectors (ssh-facts, k8s_observe, ...)
+    Collector(commands::CollectorArgs),
 }
 
 fn main() -> Result<()> {

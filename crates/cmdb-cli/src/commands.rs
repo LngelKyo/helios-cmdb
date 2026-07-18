@@ -3,7 +3,7 @@
 use crate::output;
 use crate::{Cli, Command};
 use anyhow::{anyhow, Result};
-use clap::Args;
+use clap::{Args, Subcommand};
 use cmdb_core::entity::{EntityInput, EntityRef};
 use cmdb_core::fact::FactInput;
 use cmdb_core::id::EntityId;
@@ -27,6 +27,8 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::List(args) => list(&namespace, &store, args).await?,
         Command::Relate(args) => relate(&namespace, &store, args).await?,
         Command::Query(args) => query(&store, args).await?,
+        Command::Serve(args) => serve(&namespace, &actor, &store, args).await?,
+        Command::Collector(args) => run_collector(&namespace, &actor, &store, args).await?,
     }
     Ok(())
 }
@@ -247,5 +249,132 @@ async fn query(store: &PgStore, args: QueryArgs) -> Result<()> {
     };
     let hits = store.traverse(from_id, step).await?;
     output::traverse_hits(&hits);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// serve
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct ServeArgs {
+    #[command(subcommand)]
+    pub command: ServeCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServeCommand {
+    /// MCP server (stdio for Claude Code; http for remote fleet agents)
+    Mcp(McpArgs),
+    /// Subscribe to cc.fleet.> and serve cmdb.query.> RPC over the ana bus
+    Bus(BusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct McpArgs {
+    #[arg(long, default_value = "stdio")]
+    pub transport: String,
+    #[arg(long, default_value = "127.0.0.1:8765")]
+    pub addr: String,
+}
+
+#[derive(Args, Debug)]
+pub struct BusArgs {
+    #[arg(long, env = "CMDB_NATS_URL", default_value = "nats://127.0.0.1:4222")]
+    pub nats_url: String,
+    #[arg(long, default_value = "cmdb")]
+    pub identity: String,
+    #[arg(long, env = "CMDB_ANA_PREFIX", default_value = "cc.fleet")]
+    pub prefix: String,
+}
+
+async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -> Result<()> {
+    let store: std::sync::Arc<dyn Store> = std::sync::Arc::new(store.clone());
+    match args.command {
+        ServeCommand::Mcp(m) => {
+            // Actor tag for writes coming through MCP — carries the namespace
+            // and configurable actor id so provenance is traceable.
+            let mcp_actor = format!("{actor}/mcp:{namespace}");
+            match m.transport.as_str() {
+                "stdio" => cmdb_mcp::serve_stdio(store, mcp_actor).await?,
+                "http" => {
+                    let addr: std::net::SocketAddr = m.addr.parse()?;
+                    cmdb_mcp::serve_http(store, mcp_actor, addr).await?;
+                }
+                other => return Err(anyhow!("unknown transport: {other}")),
+            }
+        }
+        ServeCommand::Bus(b) => {
+            cmdb_ana_bridge::serve_bus(store, &b.nats_url, &b.identity, &b.prefix).await?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// collectors
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct CollectorArgs {
+    #[command(subcommand)]
+    pub command: CollectorCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CollectorCommand {
+    /// List registered collectors
+    List,
+    /// Run a collector by name
+    Run {
+        /// Collector name (e.g. ssh-facts)
+        name: String,
+        /// Comma-separated targets (collector-specific; e.g. hosts for ssh-facts)
+        #[arg(long, value_delimiter = ',')]
+        targets: Vec<String>,
+        /// Run interval in seconds (0 = one-shot)
+        #[arg(long, default_value_t = 0)]
+        interval: u64,
+        /// SSH user (ssh-facts only)
+        #[arg(long, env = "CMDB_SSH_USER")]
+        ssh_user: Option<String>,
+        /// SSH port (ssh-facts only)
+        #[arg(long, default_value_t = 22)]
+        ssh_port: u16,
+    },
+}
+
+async fn run_collector(
+    namespace: &str,
+    actor: &str,
+    store: &PgStore,
+    args: CollectorArgs,
+) -> Result<()> {
+    let store: std::sync::Arc<dyn Store> = std::sync::Arc::new(store.clone());
+    match args.command {
+        CollectorCommand::List => {
+            println!("{:<18} {}", "name", "description");
+            println!("{}", "-".repeat(70));
+            for c in cmdb_collectors::list() {
+                println!("{:<18} {}", c.name, c.description);
+            }
+        }        CollectorCommand::Run {
+            name,
+            targets,
+            interval,
+            ssh_user,
+            ssh_port,
+        } => {
+            let cfg = cmdb_collectors::CollectorConfig {
+                namespace: namespace.to_string(),
+                actor: actor.to_string(),
+                targets,
+                interval_seconds: interval,
+                ssh_user,
+                ssh_port,
+            };
+            cmdb_collectors::run(&name, store, cfg).await?;
+        }
+    }
     Ok(())
 }

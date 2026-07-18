@@ -45,21 +45,6 @@ ON CONFLICT (namespace, from_id, to_id, type) DO UPDATE
 RETURNING id, namespace, from_id, to_id, type AS relation_type, props, created_at
 "#;
 
-pub const INSERT_FACT: &str = r#"
-WITH new_fact AS (
-  INSERT INTO facts (id, namespace, entity_id, key, value, source, confidence, observed_at, ttl_seconds)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-  RETURNING id, namespace, entity_id, key, value, source, superseded_by
-)
-UPDATE facts
-   SET superseded_by = (SELECT id FROM new_fact)
- WHERE facts.entity_id = $3
-   AND facts.key = $4
-   AND facts.superseded_by IS NULL
-   AND facts.id <> (SELECT id FROM new_fact)
-RETURNING (SELECT id FROM new_fact) AS new_id;
-"#;
-
 pub const INSERT_FACT_SIMPLE: &str = r#"
 INSERT INTO facts (id, namespace, entity_id, key, value, source, confidence, observed_at, ttl_seconds)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)

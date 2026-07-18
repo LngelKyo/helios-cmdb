@@ -8,9 +8,12 @@ authors.workspace = true
 
 [dependencies]
 cmdb-core.workspace = true
+cmdb-store-pg.workspace = true
 async-nats.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
