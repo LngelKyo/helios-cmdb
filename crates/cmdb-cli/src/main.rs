@@ -61,6 +61,10 @@ pub enum Command {
     Collector(commands::CollectorArgs),
     /// Interactive TUI browser
     Tui,
+    /// Manage scoped API tokens (create / list / revoke)
+    Token(commands::TokenArgs),
+    /// Entity-type governance (propose / approve / reject)
+    Type(commands::TypeArgs),
 }
 
 fn main() -> Result<()> {

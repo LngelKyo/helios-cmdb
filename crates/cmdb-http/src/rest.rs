@@ -1,6 +1,7 @@
 //! REST API. All routes under `/api/v1/`.
 
 use crate::gql::{schema_for, Schema};
+use crate::ui;
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
@@ -9,6 +10,7 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use cmdb_auth::TokenManager;
 use cmdb_core::entity::{EntityInput, EntityRef};
 use cmdb_core::fact::FactInput;
 use cmdb_core::id::EntityId;
@@ -26,16 +28,29 @@ use std::sync::Arc;
 struct AppState {
     store: Arc<dyn Store>,
     actor: String,
+    token_mgr: Option<TokenManager>,
+    require_auth: bool,
 }
 
 pub async fn run(store: Arc<dyn Store>, actor: String, addr: SocketAddr) -> Result<()> {
+    run_with_options(store, actor, addr, crate::HttpOptions::default()).await
+}
+
+pub async fn run_with_options(
+    store: Arc<dyn Store>,
+    actor: String,
+    addr: SocketAddr,
+    opts: crate::HttpOptions,
+) -> Result<()> {
     let schema = schema_for(store.clone());
     let state = AppState {
         store: store.clone(),
         actor,
+        token_mgr: None,
+        require_auth: opts.require_auth,
     };
-    let app = Router::new()
-        .route("/healthz", get(healthz))
+
+    let api_routes: Router<(AppState, Schema)> = Router::new()
         .route("/api/v1/entities/{id}", get(get_entity).delete(delete_entity))
         .route("/api/v1/entities", get(list_entities).post(upsert_entity))
         .route("/api/v1/entities/{id}/facts", get(list_facts))
@@ -46,12 +61,30 @@ pub async fn run(store: Arc<dyn Store>, actor: String, addr: SocketAddr) -> Resu
         .route("/api/v1/types", get(list_types))
         .route("/api/v1/search", get(search))
         .route("/api/v1/history", get(history))
-        .route("/graphql", post(graphql_handler))
-        .route("/graphql/playground", get(playground))
-        .with_state((state, schema));
+        .route("/graphql", post(graphql_handler));
+
+    let mut app: Router<(AppState, Schema)> = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/graphql/playground", get(playground));
+
+    if opts.serve_ui {
+        app = app
+            .route("/ui", get(ui::index))
+            .route("/ui/{*path}", get(ui::asset))
+            .route("/", get(ui::index));
+    }
+
+    app = app.merge(api_routes);
+
+    let app = app.with_state((state, schema));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "HTTP server listening (REST + GraphQL)");
+    tracing::info!(
+        %addr,
+        require_auth = opts.require_auth,
+        serve_ui = opts.serve_ui,
+        "HTTP server listening (REST + GraphQL + UI)"
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

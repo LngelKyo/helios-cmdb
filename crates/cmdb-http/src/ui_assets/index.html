@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>helios-cmdb</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0; background: #0d1117; color: #c9d1d9; height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  header {
+    background: #161b22; border-bottom: 1px solid #30363d;
+    padding: 10px 16px; display: flex; gap: 12px; align-items: center;
+  }
+  header h1 { font-size: 16px; margin: 0; color: #58a6ff; }
+  header input {
+    background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+    padding: 6px 10px; border-radius: 6px; font-size: 13px; flex: 1;
+  }
+  header input:focus { outline: none; border-color: #58a6ff; }
+  header button {
+    background: #238636; color: white; border: none; padding: 6px 14px;
+    border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  header button:hover { background: #2ea043; }
+  header .tok { width: 320px; font-family: monospace; font-size: 12px; }
+  .row { display: flex; flex: 1; overflow: hidden; }
+  #list {
+    width: 360px; overflow-y: auto; border-right: 1px solid #30363d;
+    background: #0d1117;
+  }
+  .entity-row {
+    padding: 10px 14px; border-bottom: 1px solid #21262d; cursor: pointer;
+  }
+  .entity-row:hover { background: #161b22; }
+  .entity-row.selected { background: #1f6feb33; border-left: 3px solid #58a6ff; }
+  .entity-row .type { color: #79c0ff; font-size: 11px; }
+  .entity-row .name { color: #d29922; font-size: 14px; }
+  #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #detail {
+    flex: 1; overflow-y: auto; padding: 16px;
+  }
+  #detail h2 { margin: 0 0 12px 0; color: #d29922; }
+  #detail h3 { color: #79c0ff; margin: 16px 0 6px 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+  #detail table { border-collapse: collapse; width: 100%; }
+  #detail td { padding: 4px 8px; border-bottom: 1px solid #21262d; vertical-align: top; }
+  #detail td:first-child { color: #79c0ff; width: 30%; font-family: monospace; font-size: 12px; }
+  #detail td:last-child { word-break: break-all; }
+  #graph-wrap {
+    height: 320px; border-top: 1px solid #30363d; background: #0d1117;
+    position: relative;
+  }
+  #graph { width: 100%; height: 100%; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; background: #30363d; }
+  .badge.conf { color: #56d364; }
+  .badge.read { background: #1f6feb33; color: #79c0ff; }
+  .status {
+    padding: 4px 8px; font-size: 11px; color: #8b949e;
+    background: #161b22; border-top: 1px solid #30363d;
+  }
+  .err { color: #f85149; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>helios-cmdb</h1>
+  <input id="search" placeholder="search entities... (Enter)" />
+  <input id="token" class="tok" placeholder="cmdb_... token (for auth)" type="password" />
+  <button id="refresh">refresh</button>
+</header>
+
+<div class="row">
+  <div id="list"></div>
+  <div id="main">
+    <div id="detail"><p style="color:#8b949e">Select an entity to view details.</p></div>
+    <div id="graph-wrap"><div id="graph"></div></div>
+  </div>
+</div>
+
+<div class="status" id="status">ready</div>
+
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script>
+const state = { entities: [], selected: null, token: '' };
+
+function setStatus(msg, err) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status' + (err ? ' err' : '');
+}
+
+async function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  const r = await fetch(path, { ...opts, headers });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`${r.status} ${r.statusText}: ${t}`);
+  }
+  return r.json();
+}
+
+async function loadEntities(typeFilter) {
+  const params = new URLSearchParams();
+  if (typeFilter) params.set('type', typeFilter);
+  params.set('limit', '200');
+  const d = await api('/api/v1/entities?' + params.toString());
+  state.entities = d.entities || [];
+  renderList();
+  setStatus(`loaded ${state.entities.length} entities`);
+}
+
+function renderList() {
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  for (const e of state.entities) {
+    const div = document.createElement('div');
+    div.className = 'entity-row' + (state.selected && state.selected.id === e.id ? ' selected' : '');
+    div.innerHTML = `<div class="type">${e.type}</div><div class="name">${e.name}</div>`;
+    div.onclick = () => selectEntity(e.id);
+    list.appendChild(div);
+  }
+}
+
+async function selectEntity(id) {
+  state.selected = state.entities.find(e => e.id === id);
+  if (!state.selected) return;
+  renderList();
+  renderDetail(state.selected);
+  try {
+    const [facts, trav] = await Promise.all([
+      api('/api/v1/entities/' + id + '/facts').catch(() => ({ facts: [] })),
+      api('/api/v1/entities/' + id + '/traverse?depth=2&direction=both'),
+    ]);
+    renderFacts(facts.facts || []);
+    renderGraph(state.selected, trav.hits || []);
+  } catch (e) {
+    setStatus('detail load failed: ' + e.message, true);
+  }
+}
+
+function renderDetail(e) {
+  const detail = document.getElementById('detail');
+  const attrRows = Object.entries(e.attrs || {}).map(([k, v]) =>
+    `<tr><td>${k}</td><td>${JSON.stringify(v)}</td></tr>`).join('');
+  detail.innerHTML = `
+    <h2>${e.name}</h2>
+    <table>
+      <tr><td>id</td><td>${e.id}</td></tr>
+      <tr><td>type</td><td>${e.type}</td></tr>
+      <tr><td>namespace</td><td>${e.namespace}</td></tr>
+      <tr><td>version</td><td>${e.version}</td></tr>
+      <tr><td>tags</td><td>${(e.tags || []).join(', ') || '—'}</td></tr>
+    </table>
+    <h3>attributes</h3>
+    <table>${attrRows || '<tr><td colspan=2><i>none</i></td></tr>'}</table>
+    <h3>facts</h3>
+    <table id="facts-table"><tr><td colspan=2><i>loading…</i></td></tr></table>
+  `;
+}
+
+function renderFacts(facts) {
+  const tbl = document.getElementById('facts-table');
+  if (!facts.length) {
+    tbl.innerHTML = '<tr><td colspan=2><i>none</i></td></tr>';
+    return;
+  }
+  tbl.innerHTML = facts.map(f =>
+    `<tr><td>${f.key}<br><span class="badge conf">conf ${(f.confidence||0).toFixed(2)}</span></td>
+         <td>${JSON.stringify(f.value)}<br><span class="badge">${f.source_identity || f.source_identity || ''}</span></td></tr>`
+  ).join('');
+}
+
+function renderGraph(center, hits) {
+  const nodes = new vis.DataSet();
+  const edges = new vis.DataSet();
+  nodes.add({
+    id: center.id,
+    label: center.name,
+    color: { background: '#1f6feb', border: '#58a6ff' },
+    font: { color: 'white' },
+  });
+  for (const h of hits) {
+    nodes.add({
+      id: h.entity.id,
+      label: h.entity.name,
+      color: { background: typeColor(h.entity.type), border: '#30363d' },
+      font: { color: '#c9d1d9' },
+    });
+    const from = h.depth === 0 ? center.id : h.path[h.path.length - 2] || center.id;
+    edges.add({ from, to: h.entity.id, label: h.via, font: { color: '#8b949e', size: 9 } });
+  }
+  const container = document.getElementById('graph');
+  container.innerHTML = '';
+  new vis.Network(container, { nodes, edges }, {
+    physics: { stabilization: { iterations: 80 } },
+    nodes: { shape: 'box', margin: 8 },
+    edges: { arrows: 'to', color: '#30363d' },
+  });
+}
+
+function typeColor(t) {
+  if (t.startsWith('fleet.')) return '#238636';
+  if (t.startsWith('infra.')) return '#9e6a03';
+  if (t.startsWith('app.')) return '#8957e5';
+  if (t.startsWith('secret.')) return '#da3633';
+  return '#30363d';
+}
+
+document.getElementById('refresh').onclick = () => loadEntities();
+document.getElementById('token').onchange = (e) => {
+  state.token = e.target.value;
+  localStorage.setItem('cmdb_token', state.token);
+  setStatus('token saved');
+};
+document.getElementById('search').addEventListener('keydown', async (e) => {
+  if (e.key !== 'Enter') return;
+  const q = e.target.value.trim();
+  if (!q) return loadEntities();
+  try {
+    const d = await api('/api/v1/search?q=' + encodeURIComponent(q));
+    state.entities = (d.results || []).map(r => r.entity || r);
+    renderList();
+    setStatus(`search [${d.mode || 'substring'}]: ${d.count} hits`);
+  } catch (err) {
+    setStatus('search failed: ' + err.message, true);
+  }
+});
+
+// boot
+state.token = localStorage.getItem('cmdb_token') || '';
+if (state.token) document.getElementById('token').value = state.token;
+loadEntities();
+</script>
+</body>
+</html>

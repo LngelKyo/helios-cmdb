@@ -5,6 +5,7 @@ members = [
     "crates/cmdb-store-pg",
     "crates/cmdb-provenance",
     "crates/cmdb-embedding",
+    "crates/cmdb-auth",
     "crates/cmdb-ana-bridge",
     "crates/cmdb-mcp",
     "crates/cmdb-http",
@@ -26,6 +27,7 @@ cmdb-core = { path = "crates/cmdb-core" }
 cmdb-store-pg = { path = "crates/cmdb-store-pg" }
 cmdb-provenance = { path = "crates/cmdb-provenance" }
 cmdb-embedding = { path = "crates/cmdb-embedding" }
+cmdb-auth = { path = "crates/cmdb-auth" }
 cmdb-ana-bridge = { path = "crates/cmdb-ana-bridge" }
 cmdb-mcp = { path = "crates/cmdb-mcp" }
 cmdb-http = { path = "crates/cmdb-http" }

@@ -33,6 +33,8 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let store_arc: std::sync::Arc<dyn Store> = std::sync::Arc::new(store.clone());
             cmdb_tui::run(store_arc, namespace.clone()).await?;
         }
+        Command::Token(args) => token_cmd(&store, args).await?,
+        Command::Type(args) => type_cmd(&namespace, &actor, &store, args).await?,
     }
     Ok(())
 }
@@ -391,7 +393,6 @@ pub enum CollectorCommand {
         ssh_port: u16,
     },
 }
-
 async fn run_collector(
     namespace: &str,
     actor: &str,
@@ -406,7 +407,8 @@ async fn run_collector(
             for c in cmdb_collectors::list() {
                 println!("{:<18} {}", c.name, c.description);
             }
-        }        CollectorCommand::Run {
+        }
+        CollectorCommand::Run {
             name,
             targets,
             interval,
@@ -422,6 +424,282 @@ async fn run_collector(
                 ssh_port,
             };
             cmdb_collectors::run(&name, store, cfg).await?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// token
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct TokenArgs {
+    #[command(subcommand)]
+    pub command: TokenCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TokenCommand {
+    /// Create a new scoped token. Prints the raw secret ONCE.
+    Create {
+        #[arg(long)]
+        identity: String,
+        /// Namespace scope (empty = all). Comma-separated.
+        #[arg(long, value_delimiter = ',')]
+        ns_scope: Vec<String>,
+        /// Operation scope: read, write, admin (empty = all). Comma-separated.
+        #[arg(long, value_delimiter = ',')]
+        ops: Vec<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        expires_days: Option<i64>,
+    },
+    /// List all tokens (revoked and active).
+    List,
+    /// Revoke a token by id.
+    Revoke { id: String },
+}
+
+async fn token_cmd(store: &PgStore, args: TokenArgs) -> Result<()> {
+    let mgr = cmdb_auth::TokenManager::new(store.pool().clone());
+    match args.command {
+        TokenCommand::Create {
+            identity,
+            ns_scope,
+            ops,
+            description,
+            expires_days,
+        } => {
+            let expires_at = expires_days.map(|d| chrono::Utc::now() + chrono::Duration::days(d));
+            let created = mgr
+                .create(cmdb_auth::CreateToken {
+                    identity,
+                    namespace_scope: ns_scope,
+                    op_scope: ops,
+                    description,
+                    expires_at,
+                })
+                .await?;
+            println!("token id:     {}", created.token.id);
+            println!("identity:     {}", created.token.identity);
+            println!("namespaces:   {:?}", created.token.namespace_scope);
+            println!("ops:          {:?}", created.token.op_scope);
+            println!("\nRAW SECRET (store securely; will not be shown again):");
+            println!("  {}", created.raw);
+        }
+        TokenCommand::List => {
+            let tokens = mgr.list().await?;
+            if tokens.is_empty() {
+                println!("(no tokens)");
+                return Ok(());
+            }
+            println!(
+                "{:<28} {:<20} {:<14} {:<14} {:<10}",
+                "id", "identity", "namespaces", "ops", "status"
+            );
+            println!("{}", "-".repeat(90));
+            for t in tokens {
+                let status = if t.revoked_at.is_some() {
+                    "revoked"
+                } else if t.expires_at.map(|e| e < chrono::Utc::now()).unwrap_or(false) {
+                    "expired"
+                } else {
+                    "active"
+                };
+                println!(
+                    "{:<28} {:<20} {:<14} {:<14} {:<10}",
+                    t.id,
+                    t.identity,
+                    t.namespace_scope.join(","),
+                    t.op_scope.join(","),
+                    status
+                );
+            }
+        }
+        TokenCommand::Revoke { id } => {
+            mgr.revoke(&id).await?;
+            println!("revoked: {}", id);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// type governance
+// ---------------------------------------------------------------------------
+
+#[derive(Args, Debug)]
+pub struct TypeArgs {
+    #[command(subcommand)]
+    pub command: TypeCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TypeCommand {
+    /// List registered entity types from the metamodel.
+    List,
+    /// Propose a new entity type (creates a metamodel.proposal entity).
+    Propose {
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_name = "JSON")]
+        schema: String,
+        #[arg(long, default_value = "user:cli")]
+        by: String,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List pending proposals.
+    Proposals,
+    /// Approve a proposal and register the type.
+    Approve {
+        id: String,
+        #[arg(long, default_value = "user:admin")]
+        by: String,
+    },
+    /// Reject a proposal.
+    Reject {
+        id: String,
+        #[arg(long, default_value = "user:admin")]
+        by: String,
+    },
+}
+
+async fn type_cmd(namespace: &str, actor: &str, store: &PgStore, args: TypeArgs) -> Result<()> {
+    match args.command {
+        TypeCommand::List => {
+            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT name, description FROM entity_types WHERE namespace = $1 ORDER BY name",
+            )
+            .bind(namespace)
+            .fetch_all(store.pool())
+            .await?;
+            for (name, desc) in rows {
+                println!("{:<22} {}", name, desc.unwrap_or_default());
+            }
+        }
+        TypeCommand::Propose {
+            name,
+            schema,
+            by,
+            description,
+        } => {
+            let schema_json: serde_json::Value = serde_json::from_str(&schema)?;
+            let proposal_attrs = serde_json::json!({
+                "proposed_type": name,
+                "proposed_schema": schema_json,
+                "proposed_by": by,
+                "description": description,
+                "status": "pending",
+            });
+            let proposal_name = format!("proposal:{}", name);
+            let input = EntityInput::new(namespace, "metamodel.proposal", &proposal_name)
+                .with_attrs(proposal_attrs);
+            let entity = store.put_entity(input, Source::new_cli(actor)).await?;
+            println!("proposal created:");
+            println!("  id:   {}", entity.id);
+            println!("  type: {}", name);
+            println!("\napprove with: cmdb type approve {}", entity.id);
+        }
+        TypeCommand::Proposals => {
+            let filter = QueryFilter::new().in_namespace(namespace).of_type("metamodel.proposal");
+            let proposals = store.query_entities(filter).await?;
+            if proposals.is_empty() {
+                println!("(no proposals)");
+                return Ok(());
+            }
+            for p in proposals {
+                let status = p.attrs.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                let proposed = p.attrs.get("proposed_type").and_then(|v| v.as_str()).unwrap_or("?");
+                println!(
+                    "{:<28} {:<14} {:<24} by={}",
+                    p.id.to_string(),
+                    status,
+                    proposed,
+                    p.attrs.get("proposed_by").and_then(|v| v.as_str()).unwrap_or("?")
+                );
+            }
+        }
+        TypeCommand::Approve { id, by } => {
+            let proposal_id: cmdb_core::id::EntityId = id.parse()?;
+            let proposal = store
+                .get_entity_by_id(proposal_id)
+                .await?
+                .ok_or_else(|| anyhow!("proposal not found: {}", proposal_id))?;
+
+            if proposal.entity_type != "metamodel.proposal" {
+                return Err(anyhow!("not a proposal: {}", proposal.entity_type));
+            }
+            let status = proposal.attrs.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status == "approved" {
+                return Err(anyhow!("already approved"));
+            }
+
+            let proposed_type = proposal
+                .attrs
+                .get("proposed_type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("proposal missing proposed_type"))?
+                .to_string();
+            let proposed_schema = proposal
+                .attrs
+                .get("proposed_schema")
+                .cloned()
+                .ok_or_else(|| anyhow!("proposal missing proposed_schema"))?;
+            let description: Option<String> = proposal
+                .attrs
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let namespace = proposal.namespace.clone();
+
+            // Register the type.
+            sqlx::query(
+                r#"INSERT INTO entity_types (namespace, name, description, attrs_schema)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (namespace, name) DO UPDATE
+                     SET attrs_schema = EXCLUDED.attrs_schema,
+                         description = EXCLUDED.description,
+                         updated_at = NOW()"#,
+            )
+            .bind(&namespace)
+            .bind(&proposed_type)
+            .bind(&description)
+            .bind(&proposed_schema)
+            .execute(store.pool())
+            .await?;
+
+            // Mark proposal as approved.
+            let mut new_attrs = proposal.attrs.clone();
+            new_attrs["status"] = serde_json::json!("approved");
+            new_attrs["decided_by"] = serde_json::json!(by);
+            new_attrs["decided_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            let input = EntityInput::new(&namespace, "metamodel.proposal", &proposal.name)
+                .with_attrs(new_attrs);
+            store
+                .put_entity(input, Source::new_cli(&by))
+                .await?;
+
+            println!("approved: {} -> registered type {}/{}", proposal_id, namespace, proposed_type);
+        }
+        TypeCommand::Reject { id, by } => {
+            let proposal_id: cmdb_core::id::EntityId = id.parse()?;
+            let proposal = store
+                .get_entity_by_id(proposal_id)
+                .await?
+                .ok_or_else(|| anyhow!("proposal not found: {}", proposal_id))?;
+
+            let mut new_attrs = proposal.attrs.clone();
+            new_attrs["status"] = serde_json::json!("rejected");
+            new_attrs["decided_by"] = serde_json::json!(by);
+            new_attrs["decided_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            let input = EntityInput::new(&proposal.namespace, "metamodel.proposal", &proposal.name)
+                .with_attrs(new_attrs);
+            store.put_entity(input, Source::new_cli(&by)).await?;
+
+            println!("rejected: {}", proposal_id);
         }
     }
     Ok(())
