@@ -202,6 +202,16 @@ impl PgStore {
         let url = normalize_pg_url(url);
         let pool = PgPoolOptions::new()
             .max_connections(8)
+            .after_connect(|conn, _| Box::pin(async move {
+                // AGE 1.6.0 on PG16 requires `LOAD 'age'` per session
+                // (shared_preload_libraries not set on the k3s PG). This
+                // callback runs on every new pooled connection.
+                sqlx::query("LOAD 'age'").execute(&mut *conn).await?;
+                sqlx::query("SET search_path = public, ag_catalog")
+                    .execute(&mut *conn)
+                    .await
+                    .map(|_| ())
+            }))
             .connect(&url)
             .await?;
         Ok(Self { pool, embedder: None })

@@ -68,11 +68,15 @@ impl McpServer {
             "initialized" | "notifications/initialized" => Ok(Value::Null),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({
-                "tools": self.tool_list().iter().map(|t| json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": t.input_schema,
-                })).collect::<Vec<_>>()
+                "tools": self.tool_list().iter().map(|t| {
+                    let schema: Value = serde_json::from_str(t.input_schema)
+                        .unwrap_or_else(|_| json!({"type":"object"}));
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": schema,
+                    })
+                }).collect::<Vec<_>>()
             })),
             "tools/call" => {
                 let p = params.ok_or("missing params")?;
