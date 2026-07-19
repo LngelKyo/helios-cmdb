@@ -34,26 +34,166 @@ pub struct PgStore {
 /// each graph). Renamed to `cmdb_graph` to avoid the collision.
 pub const GRAPH_NAME: &str = "cmdb_graph";
 
-/// Inject `options=-c search_path=public,ag_catalog` into a Postgres URL
-/// if not already present. This is CRITICAL for two reasons:
+/// Ensure a Postgres connection URL carries `options=-c search_path=public,ag_catalog`.
+///
+/// This is CRITICAL for two reasons:
 ///   1. AGE's `agtype` operator class lives in `ag_catalog`; without it in
 ///      search_path, MERGE / WHERE on agtype columns fails with misleading
-///      "operator does not exist" errors (was previously misdiagnosed as
-///      an AGE 1.7.0-rc0 bug — the bug was actually here).
+///      "operator does not exist" errors.
 ///   2. The AGE graph creates a same-named schema; if that schema wins
-///      search_path precedence (because it sorts before `public`), new
-///      `_sqlx_migrations` rows land in the wrong schema and subsequent
-///      `migrate` runs lose track of state.
-/// Setting `public` first keeps our tables where we expect them.
+///      search_path precedence, `_sqlx_migrations` rows land in the wrong
+///      schema and subsequent `migrate` runs lose track of state.
+///
+/// Behavior:
+///   - URL without `?`: append `?options=-c search_path=public,ag_catalog`.
+///   - URL with `?` but no `options=`: append `&options=...`.
+///   - URL with `options=` that already mentions `search_path`: leave alone
+///     (assume caller knows what they're doing).
+///   - URL with `options=` but no `search_path`: rewrite the options value
+///     to include `-c search_path=public,ag_catalog` appended after the
+///     caller's existing options. (libpq parses the options string as
+///     space-separated `-c key=value` flags.)
 pub fn normalize_pg_url(url: &str) -> String {
-    const OPTS_ENCODED: &str = "options=-c%20search_path%3Dpublic%2Cag_catalog";
-    if url.contains("options=") {
-        return url.to_string();
+    let (base, query) = match url.find('?') {
+        Some(i) => (&url[..i], &url[i + 1..]),
+        None => return format!("{url}?options=-c%20search_path%3Dpublic%2Cag_catalog"),
+    };
+
+    // Walk the query params, looking for an existing options=.
+    let mut params: Vec<(String, String)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (k.to_string(), percent_decode(v)),
+            None => (p.to_string(), String::new()),
+        })
+        .collect();
+
+    let existing = params.iter().find(|(k, _)| k == "options");
+    match existing {
+        Some((_, v)) if v.contains("search_path") => {
+            // Caller already sets search_path. Assume they know what they're
+            // doing — but warn if ag_catalog isn't in it, since that's the
+            // specific schema we need for AGE.
+            if !v.contains("ag_catalog") {
+                tracing::warn!(
+                    url = %url,
+                    "existing options= sets search_path without ag_catalog; AGE operators may fail"
+                );
+            }
+            url.to_string()
+        }
+        Some(_) => {
+            // Existing options= without search_path — augment it.
+            for (k, v) in params.iter_mut() {
+                if k == "options" {
+                    let mut new_opts = v.clone();
+                    new_opts.push_str(" -c search_path=public,ag_catalog");
+                    *v = new_opts;
+                    break;
+                }
+            }
+            let q = params
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, percent_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            format!("{base}?{q}")
+        }
+        None => {
+            params.push((
+                "options".to_string(),
+                "-c search_path=public,ag_catalog".to_string(),
+            ));
+            let q = params
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, percent_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            format!("{base}?{q}")
+        }
     }
-    if url.contains('?') {
-        format!("{url}&{OPTS_ENCODED}")
-    } else {
-        format!("{url}?{OPTS_ENCODED}")
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(b as char);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(' ');
+        } else {
+            out.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+    out
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push_str("%20"),
+            b'=' => out.push_str("%3D"),
+            b',' => out.push_str("%2C"),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn appends_options_to_bare_url() {
+        let out = normalize_pg_url("postgres://user@host/db");
+        assert!(out.contains("options="));
+        assert!(out.contains("search_path"));
+        assert!(out.contains("ag_catalog"));
+        assert!(out.starts_with("postgres://user@host/db?"));
+    }
+
+    #[test]
+    fn appends_options_to_url_with_query() {
+        let out = normalize_pg_url("postgres://user@host/db?sslmode=require");
+        assert!(out.contains("options="));
+        assert!(out.contains("sslmode=require"));
+        assert!(out.contains("&options="));
+    }
+
+    #[test]
+    fn preserves_existing_search_path() {
+        let url = "postgres://user@host/db?options=-c%20search_path%3Dapplication%2Cag_catalog";
+        let out = normalize_pg_url(url);
+        assert_eq!(out, url, "should be unchanged when search_path present");
+    }
+
+    #[test]
+    fn augments_options_without_search_path() {
+        let url = "postgres://user@host/db?options=-c%20statement_timeout%3D5000";
+        let out = normalize_pg_url(url);
+        // Should still have the original statement_timeout AND add search_path.
+        assert!(out.contains("statement_timeout"), "out = {out}");
+        assert!(out.contains("search_path"), "out = {out}");
+        assert!(out.contains("ag_catalog"), "out = {out}");
+        // Should still be one options= param (not two).
+        assert_eq!(out.matches("options=").count(), 1);
     }
 }
 

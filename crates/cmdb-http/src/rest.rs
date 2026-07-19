@@ -100,20 +100,27 @@ pub async fn run_with_options_and_pool(
                 || path.starts_with("/ui/")
                 || path == "/graphql/playground";
             if is_public || !st.require_auth {
+                // Insert a None principal so GraphQL handler's extractor succeeds.
+                let mut req = req;
+                req.extensions_mut().insert(None::<cmdb_auth::Principal>);
                 return next.run(req).await;
             }
             match st.check_token(req.headers()).await {
                 Ok(Some(principal)) => {
                     // Scope enforcement: write methods require 'write' (or
                     // 'admin'). 'admin' implies 'write' implies 'read'.
-                    // We only check op_scope here; namespace_scope is
-                    // checked in handlers that have access to the request's
-                    // target namespace.
+                    //
+                    // GraphQL is exempt from the method-based check because
+                    // it uses POST for both queries (read) and mutations
+                    // (write). Scope is enforced at the resolver level via
+                    // the Principal injected into the GraphQL context.
                     let method = req.method().clone();
-                    let needs_write = method == axum::http::Method::POST
-                        || method == axum::http::Method::PUT
-                        || method == axum::http::Method::DELETE
-                        || method == axum::http::Method::PATCH;
+                    let path_is_graphql = path == "/graphql";
+                    let needs_write = !path_is_graphql
+                        && (method == axum::http::Method::POST
+                            || method == axum::http::Method::PUT
+                            || method == axum::http::Method::DELETE
+                            || method == axum::http::Method::PATCH);
                     if needs_write
                         && !principal.op_scope.is_empty()
                         && !principal.op_scope.contains("write")
@@ -125,10 +132,16 @@ pub async fn run_with_options_and_pool(
                         .into_response();
                     }
                     let mut req = req;
-                    req.extensions_mut().insert(principal);
+                    req.extensions_mut().insert(Some(principal));
                     next.run(req).await
                 }
-                Ok(None) => next.run(req).await,
+                Ok(None) => {
+                    // unreachable because is_public && !require_auth returned above,
+                    // but keep a sane fallback.
+                    let mut req = req;
+                    req.extensions_mut().insert(None::<cmdb_auth::Principal>);
+                    next.run(req).await
+                }
                 Err(e) => e.into_response(),
             }
         }
@@ -526,9 +539,15 @@ async fn history(
 
 async fn graphql_handler(
     State((_, schema)): State<(AppState, Schema)>,
+    axum::extract::Extension(principal): axum::extract::Extension<Option<cmdb_auth::Principal>>,
     req: async_graphql_axum::GraphQLRequest,
 ) -> Result<Json<Value>, AppError> {
-    let resp = schema.execute(req.into_inner()).await;
+    // principal was inserted into extensions by the auth middleware (or
+    // is None under no-auth mode). GraphQL resolvers fetch it via
+    // `ctx.data::<Option<Principal>>()` and enforce write/read scope.
+    let mut inner = req.into_inner();
+    inner = inner.data(principal);
+    let resp = schema.execute(inner).await;
     let v = serde_json::to_value(&resp).map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(v))
 }

@@ -20,12 +20,30 @@ use cmdb_core::Store;
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Extract Principal from the GraphQL context and verify it has the
+/// requested op scope. Returns GqlResult<()>; errors out with "forbidden"
+/// if scope is insufficient. Under no-auth mode (no principal) this is a
+/// no-op.
+fn require_op(ctx: &Context<'_>, op: &str) -> GqlResult<()> {
+    let principal = ctx.data::<Option<cmdb_auth::Principal>>()?;
+    if let Some(p) = principal {
+        if !p.op_scope.is_empty()
+            && !p.op_scope.contains(op)
+            && !(op == "read" && (p.op_scope.contains("write") || p.op_scope.contains("admin")))
+            && !(op == "write" && p.op_scope.contains("admin"))
+        {
+            return Err(format!("forbidden: token lacks '{op}' scope").into());
+        }
+    }
+    Ok(())
+}
+
 pub type Schema = async_graphql::Schema<QueryRoot, MutationRoot, async_graphql::EmptySubscription>;
 
 pub fn schema_for(store: Arc<dyn Store>) -> Schema {
     Schema::build(QueryRoot, MutationRoot, async_graphql::EmptySubscription)
         .data(store)
-        .data("cc.fleet".to_string())
+        .data::<Option<cmdb_auth::Principal>>(None) // default when no principal
         .finish()
 }
 
@@ -398,6 +416,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertEntityInput,
     ) -> GqlResult<GqlEntity> {
+        require_op(ctx, "write")?;
         let store = ctx.data::<Arc<dyn Store>>()?;
         let namespace = input.namespace.unwrap_or_else(|| "cc.fleet".into());
         let tags = input.tags.unwrap_or_default();
@@ -410,6 +429,7 @@ impl MutationRoot {
     }
 
     async fn delete_entity(&self, ctx: &Context<'_>, id: String) -> GqlResult<bool> {
+        require_op(ctx, "write")?;
         let store = ctx.data::<Arc<dyn Store>>()?;
         let eid = EntityId::from_str(&id)?;
         store.delete_entity(eid).await?;
@@ -417,6 +437,7 @@ impl MutationRoot {
     }
 
     async fn add_fact(&self, ctx: &Context<'_>, input: AddFactInput) -> GqlResult<GqlFact> {
+        require_op(ctx, "write")?;
         let store = ctx.data::<Arc<dyn Store>>()?;
         let namespace = input.namespace.unwrap_or_else(|| "cc.fleet".into());
         let entity_ref: EntityRef = input.entity.try_into()?;
@@ -444,6 +465,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: AddRelationInput,
     ) -> GqlResult<GqlRelation> {
+        require_op(ctx, "write")?;
         let store = ctx.data::<Arc<dyn Store>>()?;
         let namespace = input.namespace.unwrap_or_else(|| "cc.fleet".into());
         let from: EntityRef = input.from.try_into()?;
@@ -461,9 +483,88 @@ impl MutationRoot {
     }
 
     async fn delete_relation(&self, ctx: &Context<'_>, id: String) -> GqlResult<bool> {
+        require_op(ctx, "write")?;
         let store = ctx.data::<Arc<dyn Store>>()?;
         let rid = RelationId::from_str(&id)?;
         store.delete_relation(rid).await?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cmdb_core::mock::InMemoryStore;
+
+    fn build_schema() -> Schema {
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        schema_for(store)
+    }
+
+    fn request_with_principal(
+        query: &str,
+        principal: Option<cmdb_auth::Principal>,
+    ) -> async_graphql::Request {
+        async_graphql::Request::new(query).data(principal)
+    }
+
+    fn principal(ops: &[&str]) -> Option<cmdb_auth::Principal> {
+        Some(cmdb_auth::Principal {
+            identity: "test".into(),
+            namespace_scope: std::collections::BTreeSet::new(),
+            op_scope: ops.iter().map(|s| s.to_string()).collect(),
+            token_id: "t".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn query_allowed_for_read_token() {
+        let schema = build_schema();
+        let q = "{ entities(filter:{type:\"x\"}) { name } }";
+        let resp = schema
+            .execute(request_with_principal(q, principal(&["read"])))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+    }
+
+    #[tokio::test]
+    async fn mutation_forbidden_for_read_token() {
+        let schema = build_schema();
+        let q = "mutation { upsertEntity(input:{type:\"x\",name:\"y\"}) { id } }";
+        let resp = schema
+            .execute(request_with_principal(q, principal(&["read"])))
+            .await;
+        assert!(resp.is_err(), "expected error");
+        let msg = resp.errors[0].message.to_string();
+        assert!(msg.contains("write"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn mutation_allowed_for_write_token() {
+        let schema = build_schema();
+        let q = "mutation { upsertEntity(input:{type:\"x\",name:\"y\"}) { id } }";
+        let resp = schema
+            .execute(request_with_principal(q, principal(&["read", "write"])))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+    }
+
+    #[tokio::test]
+    async fn mutation_allowed_for_admin_token() {
+        let schema = build_schema();
+        let q = "mutation { upsertEntity(input:{type:\"x\",name:\"y\"}) { id } }";
+        let resp = schema
+            .execute(request_with_principal(q, principal(&["admin"])))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+    }
+
+    #[tokio::test]
+    async fn mutation_allowed_when_no_auth() {
+        // No-auth mode (principal = None): mutations succeed (no scope enforcement).
+        let schema = build_schema();
+        let q = "mutation { upsertEntity(input:{type:\"x\",name:\"y\"}) { id } }";
+        let resp = schema.execute(request_with_principal(q, None)).await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
     }
 }

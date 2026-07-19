@@ -131,10 +131,18 @@ psql "postgres://helios@host/db?options=-c%20search_path%3Dpublic%2Cag_catalog"
 - **AGE 1.7.0 stable**: when released, drop the Cypher translator
   fallback in `PgStore::cypher` (one-line removal). Verify `MERGE ... ON
   CREATE SET` syntax support.
+- **Backup/restore + AGE graph**: `pg_dump` / `pg_restore` does NOT
+  reliably capture AGE graph internals (vertices/edges stored in
+  `_ag_label_*` tables with graphid OIDs that may not survive the
+  round-trip). `ops/restore.sh` handles this by re-running `cmdb migrate`
+  after the data load — migration 0003 is idempotent and the backfill
+  DO blocks use MERGE so existing data is preserved while the graph is
+  rebuilt. If you restore manually (without restore.sh), always run
+  `cmdb migrate` after `pg_restore`.
 - **docker-socket collector**: requires `helios` user in `docker` group
   (or rootless docker). Without that, the collector logs EACCES and
   exits.
-- **Web UI**: vis-network bundled locally now (no CDN dependency). Could
+- **Web UI**: vis-network bundled locally (no CDN dependency). Could
   add: token login flow, edit-in-place, multi-namespace switcher,
   property editor for metamodel.proposal.
 - **Multi-node PG**: read replica support not tested. Streaming
@@ -143,6 +151,12 @@ psql "postgres://helios@host/db?options=-c%20search_path%3Dpublic%2Cag_catalog"
   logical decoding.
 - **MCP `cypher` tool**: returns agtype-encoded JSON strings (with
   quoted values). A future polish could decode agtype → JSON natively.
+- **`normalize_pg_url` on user-provided URLs**: if a caller provides an
+  `options=` with their own `search_path` that doesn't include
+  `ag_catalog`, we log a WARN but respect their choice. This could
+  silently resurrect AGE errors — operators should ensure either
+  `ag_catalog` is in their custom search_path or omit `options=` from
+  the URL.
 
 ## Bug history (lessons learned)
 

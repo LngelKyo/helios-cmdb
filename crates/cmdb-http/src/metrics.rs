@@ -71,3 +71,54 @@ pub fn render(c: &Counters, entities_count: i64, relations_count: i64) -> String
     ));
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_includes_all_metrics() {
+        let c = Counters::default();
+        c.http_requests.store(42, Ordering::Relaxed);
+        c.http_requests_4xx.store(3, Ordering::Relaxed);
+        c.http_requests_5xx.store(1, Ordering::Relaxed);
+        c.entities_upserted.store(100, Ordering::Relaxed);
+        c.facts_added.store(50, Ordering::Relaxed);
+        c.relations_upserted.store(10, Ordering::Relaxed);
+        c.cypher_queries.store(5, Ordering::Relaxed);
+        c.vector_searches.store(8, Ordering::Relaxed);
+
+        let out = render(&c, 9999, 42);
+        // Verify Prometheus text format essentials.
+        assert!(out.contains("# HELP cmdb_http_requests_total"));
+        assert!(out.contains("# TYPE cmdb_http_requests_total counter"));
+        assert!(out.contains("cmdb_http_requests_total 42\n"));
+        assert!(out.contains("cmdb_http_requests_total{code=\"4xx\"} 3"));
+        assert!(out.contains("cmdb_http_requests_total{code=\"5xx\"} 1"));
+        assert!(out.contains("cmdb_entities_total 9999"));
+        assert!(out.contains("cmdb_relations_total 42"));
+        assert!(out.contains("cmdb_writes_total{op=\"entity_upsert\"} 100"));
+        assert!(out.contains("cmdb_writes_total{op=\"fact_add\"} 50"));
+        assert!(out.contains("cmdb_writes_total{op=\"relation_upsert\"} 10"));
+        assert!(out.contains("cmdb_queries_total{op=\"cypher\"} 5"));
+        assert!(out.contains("cmdb_queries_total{op=\"vector_search\"} 8"));
+    }
+
+    #[test]
+    fn shared_returns_independent_counters() {
+        let a = shared();
+        let b = shared();
+        a.http_requests.store(1, Ordering::Relaxed);
+        // Different Arcs, independent state.
+        assert_eq!(b.http_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn counters_start_at_zero() {
+        let c = Counters::default();
+        assert_eq!(c.http_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(c.http_requests_4xx.load(Ordering::Relaxed), 0);
+        assert_eq!(c.http_requests_5xx.load(Ordering::Relaxed), 0);
+        assert_eq!(c.entities_upserted.load(Ordering::Relaxed), 0);
+    }
+}
