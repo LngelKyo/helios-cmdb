@@ -17,7 +17,13 @@ pub async fn index() -> Response {
 }
 
 pub async fn asset(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
+    let raw = uri.path().trim_start_matches('/');
+    // Strip "ui/" prefix so the lookup matches rust-embed's indexing
+    // (which is relative to ui_assets/).
+    let path = match raw.strip_prefix("ui/") {
+        Some(rest) => rest,
+        None => raw,
+    };
     let path = if path.is_empty() { "index.html" } else { path };
     serve(path)
 }

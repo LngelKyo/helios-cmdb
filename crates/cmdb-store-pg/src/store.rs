@@ -548,29 +548,38 @@ impl Store for PgStore {
     }
 
     async fn cypher(&self, query: &str) -> StoreResult<Vec<Vec<String>>> {
-        // Try the translator first (covers the common patterns without
-        // needing AGE; works against any Postgres).
-        match crate::cypher::translate(query) {
-            Ok((sql, _cols)) => {
-                let rows = sqlx::query(&sql)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|e| StoreError::Backend(format!("cypher translated: {e}")))?;
-                let mut out = Vec::with_capacity(rows.len());
-                for r in &rows {
-                    let cell: Option<String> = r.try_get("result").unwrap_or(None);
-                    out.push(vec![cell.unwrap_or_else(|| "null".into())]);
-                }
-                Ok(out)
-            }
-            Err(trans_err) => {
-                // Fall back to AGE for patterns the translator doesn't cover.
-                match self.age_query_raw(query).await {
-                    Ok(rows) => Ok(rows),
-                    Err(age_err) => Err(StoreError::Backend(format!(
-                        "translator: {trans_err} | age fallback: {age_err}"
+        // Try AGE native first. With search_path=public,ag_catalog (set by
+        // normalize_pg_url at connect time), AGE 1.7.0-rc0 handles vertex
+        // queries, MERGE, WHERE on most patterns. When AGE stabilizes in
+        // a future 1.7.x / 1.8.x release, the translator fallback below
+        // will become dead code and can be deleted in a one-line PR.
+        match self.age_query_raw(query).await {
+            Ok(rows) => return Ok(rows),
+            Err(age_err) => {
+                tracing::debug!(error = %age_err, cypher = %query, "AGE native failed; trying translator");
+                // Fall through to translator.
+                let age_err = age_err;
+                return match crate::cypher::translate(query) {
+                    Ok((sql, _cols)) => {
+                        let rows = sqlx::query(&sql)
+                            .fetch_all(&self.pool)
+                            .await
+                            .map_err(|e| {
+                                StoreError::Backend(format!(
+                                    "age: {age_err} | translator SQL exec: {e}"
+                                ))
+                            })?;
+                        let mut out = Vec::with_capacity(rows.len());
+                        for r in &rows {
+                            let cell: Option<String> = r.try_get("result").unwrap_or(None);
+                            out.push(vec![cell.unwrap_or_else(|| "null".into())]);
+                        }
+                        Ok(out)
+                    }
+                    Err(trans_err) => Err(StoreError::Backend(format!(
+                        "age: {age_err} | translator: {trans_err}"
                     ))),
-                }
+                };
             }
         }
     }
