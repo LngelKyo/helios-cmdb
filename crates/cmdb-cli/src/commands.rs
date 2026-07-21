@@ -349,6 +349,10 @@ pub struct BusArgs {
     pub identity: String,
     #[arg(long, env = "CMDB_ANA_PREFIX", default_value = "cc.fleet")]
     pub prefix: String,
+    #[arg(long, env = "CMDB_NATS_TOKEN")]
+    pub nats_token: Option<String>,
+    #[arg(long, env = "CMDB_NATS_CREDS")]
+    pub nats_creds: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -390,6 +394,10 @@ pub struct AllArgs {
     /// Require Bearer token on /api/v1/* and /graphql routes.
     #[arg(long, default_value_t = false)]
     pub require_auth: bool,
+    #[arg(long, env = "CMDB_NATS_TOKEN")]
+    pub nats_token: Option<String>,
+    #[arg(long, env = "CMDB_NATS_CREDS")]
+    pub nats_creds: Option<String>,
 }
 
 async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -> Result<()> {
@@ -413,7 +421,15 @@ async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -
             }
         }
         ServeCommand::Bus(b) => {
-            cmdb_ana_bridge::serve_bus(store, &b.nats_url, &b.identity, &b.prefix).await?;
+            cmdb_ana_bridge::serve_bus(
+                store,
+                &b.nats_url,
+                &b.identity,
+                &b.prefix,
+                b.nats_token.as_deref(),
+                b.nats_creds.as_deref(),
+            )
+            .await?;
         }
         ServeCommand::Http(h) => {
             let addr: std::net::SocketAddr = h.addr.parse()?;
@@ -460,7 +476,16 @@ async fn serve(namespace: &str, actor: &str, store: &PgStore, args: ServeArgs) -
             let db_url = cli_db_url.clone();
             let cb_prefix = a.prefix.clone();
             tokio::spawn(async move {
-                if let Err(e) = cmdb_ana_bridge::serve_bus(store_bus, &nats_url_bus, &bus_id, &bus_prefix).await {
+                if let Err(e) = cmdb_ana_bridge::serve_bus(
+                    store_bus,
+                    &nats_url_bus,
+                    &bus_id,
+                    &bus_prefix,
+                    a.nats_token.as_deref(),
+                    a.nats_creds.as_deref(),
+                )
+                .await
+                {
                     tracing::error!(error = %e, "ana bus task exited");
                 }
             });

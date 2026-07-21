@@ -21,8 +21,18 @@ pub async fn serve_bus(
     nats_url: &str,
     identity: &str,
     prefix: &str,
+    nats_token: Option<&str>,
+    nats_creds: Option<&str>,
 ) -> Result<()> {
-    let client = async_nats::connect(nats_url).await?;
+    let mut opts = async_nats::ConnectOptions::new()
+        .name(format!("{identity}-cmdb-bridge"));
+    if let Some(token) = nats_token {
+        opts = opts.token(token.to_string());
+    }
+    if let Some(creds) = nats_creds {
+        opts = opts.credentials_file(creds).await?;
+    }
+    let client = opts.connect(nats_url).await?;
     let scheme = Arc::new(SubjectScheme::new(prefix));
     let identity = Arc::new(identity.to_string());
 
@@ -258,8 +268,27 @@ async fn handle_query(
         return Ok(());
     };
 
+    // v0.7: send Ack immediately so the caller's
+    // query_and_wait(accept_ack=True) doesn't timeout while CMDB computes.
+    let topic = parsed_topic(&msg.subject.to_string(), scheme);
+    let ack_subject = scheme.verb(self_identity, "ack", Some(&topic));
+    let ack = serde_json::json!({
+        "type": "ack",
+        "from": self_identity,
+        "ts": now_iso(),
+        "ack_for": msg.subject.to_string(),
+        "note": "cmdb received, processing",
+        "alive": true,
+    });
+    let _ = client
+        .publish(
+            Subject::from(ack_subject),
+            serde_json::to_vec(&ack)?.into(),
+        )
+        .await;
+
     let reply_subject = env.reply_to.clone().unwrap_or_else(|| {
-        scheme.reply(self_identity, &parsed_topic(&msg.subject.to_string(), scheme))
+        scheme.reply(self_identity, &topic)
     });
 
     let data = dispatch_query(store, &env.query).await;
@@ -413,8 +442,137 @@ async fn run_json_query(store: &Arc<dyn Store>, v: &Value) -> Value {
             json!(hits.iter().map(|h| json!({
                 "depth": h.depth,
                 "entity": h.entity.name,
+                "type": h.entity.entity_type,
                 "via": h.via_relation_type,
             })).collect::<Vec<_>>())
+        }
+        "search" => {
+            let q = v.get("q").and_then(|s| s.as_str()).unwrap_or("");
+            let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(10) as u32;
+            let hits = store.vector_search(q, ns, limit).await.ok().unwrap_or_default();
+            json!(hits.iter().map(|h| json!({
+                "score": h.score,
+                "name": h.entity.name,
+                "type": h.entity.entity_type,
+            })).collect::<Vec<_>>())
+        }
+        "cypher" => {
+            let q = v.get("query").and_then(|s| s.as_str()).unwrap_or("");
+            match store.cypher(q).await {
+                Ok(rows) => json!({"rows": rows, "count": rows.len()}),
+                Err(e) => json!({"error": e.to_string()}),
+            }
+        }
+        "history" => {
+            let entity_id = v.get("entity_id")
+                .and_then(|s| s.as_str())
+                .and_then(|s| EntityId::from_str(s).ok());
+            let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(20) as u32;
+            let changes = store.history(Some(ns), entity_id, limit).await.ok().unwrap_or_default();
+            json!(changes.iter().map(|c| json!({
+                "ts": c.ts,
+                "actor": c.actor,
+                "op": c.op.as_str(),
+                "target_type": c.target_type,
+            })).collect::<Vec<_>>())
+        }
+        "facts" => {
+            let entity_id = v.get("id")
+                .and_then(|s| s.as_str())
+                .and_then(|s| EntityId::from_str(s).ok());
+            match entity_id {
+                Some(eid) => {
+                    let facts = store.effective_facts(eid, Default::default()).await.ok().unwrap_or_default();
+                    json!(facts.iter().map(|f| json!({
+                        "key": f.key,
+                        "value": f.value,
+                        "confidence": f.source.confidence,
+                        "source": f.source.identity,
+                    })).collect::<Vec<_>>())
+                }
+                None => {
+                    // Try name-based lookup
+                    let t = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+                    let n = v.get("name").and_then(|s| s.as_str()).unwrap_or("");
+                    match store.get_entity(ns, t, n).await.ok().flatten() {
+                        Some(e) => {
+                            let facts = store.effective_facts(e.id, Default::default()).await.ok().unwrap_or_default();
+                            json!(facts.iter().map(|f| json!({
+                                "key": f.key,
+                                "value": f.value,
+                                "confidence": f.source.confidence,
+                                "source": f.source.identity,
+                            })).collect::<Vec<_>>())
+                        }
+                        None => json!({"error": "entity not found"}),
+                    }
+                }
+            }
+        }
+        "relations" => {
+            let t = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+            let n = v.get("name").and_then(|s| s.as_str()).unwrap_or("");
+            match store.get_entity(ns, t, n).await.ok().flatten() {
+                Some(e) => {
+                    let step = TraverseStep {
+                        relation_type: None,
+                        direction: Direction::Both,
+                        max_depth: 1,
+                    };
+                    let hits = store.traverse(e.id, step).await.ok().unwrap_or_default();
+                    json!(hits.iter().map(|h| json!({
+                        "entity": h.entity.name,
+                        "type": h.entity.entity_type,
+                        "via": h.via_relation_type,
+                    })).collect::<Vec<_>>())
+                }
+                None => json!({"error": "entity not found"}),
+            }
+        }
+        "upsert_entity" => {
+            let entity_type = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+            let entity_name = v.get("name").and_then(|s| s.as_str()).unwrap_or("");
+            let attrs = v.get("attrs").cloned().unwrap_or(json!({}));
+            let input = cmdb_core::entity::EntityInput::new(ns, entity_type, entity_name)
+                .with_attrs(attrs);
+            let source = cmdb_core::source::Source::new_agent("cmdb-bus");
+            match store.put_entity(input, source).await {
+                Ok(e) => serde_json::to_value(&e).unwrap_or(Value::Null),
+                Err(e) => json!({"error": e.to_string()}),
+            }
+        }
+        "relate" => {
+            let from_type = v.get("from_type").and_then(|s| s.as_str()).unwrap_or("");
+            let from_name = v.get("from_name").and_then(|s| s.as_str()).unwrap_or("");
+            let to_type = v.get("to_type").and_then(|s| s.as_str()).unwrap_or("");
+            let to_name = v.get("to_name").and_then(|s| s.as_str()).unwrap_or("");
+            let rel_type = v.get("relation_type").and_then(|s| s.as_str()).unwrap_or("");
+            let input = cmdb_core::relation::RelationInput::new(
+                ns,
+                cmdb_core::entity::EntityRef::by_name(ns, from_type, from_name),
+                cmdb_core::entity::EntityRef::by_name(ns, to_type, to_name),
+                rel_type,
+            );
+            match store.put_relation(input).await {
+                Ok(r) => serde_json::to_value(&r).unwrap_or(Value::Null),
+                Err(e) => json!({"error": e.to_string()}),
+            }
+        }
+        "list_types" => {
+            json!({
+                "types": [
+                    {"name": "fleet.agent", "description": "An agent on the ana bus."},
+                    {"name": "fleet.host", "description": "A physical or virtual host."},
+                    {"name": "fleet.cluster", "description": "A cluster of agents."},
+                    {"name": "infra.vm", "description": "A virtual machine."},
+                    {"name": "infra.container", "description": "A running container."},
+                    {"name": "infra.pod", "description": "A Kubernetes pod."},
+                    {"name": "infra.service", "description": "A network service."},
+                    {"name": "app.service", "description": "An application service in the catalog."},
+                    {"name": "secret.ref", "description": "Reference to a secret."},
+                    {"name": "kb.runbook", "description": "A runbook URL."},
+                ]
+            })
         }
         other => json!({"error": format!("unknown op: {other}")}),
     }
@@ -438,7 +596,10 @@ async fn publish_discovery(
         ],
         "capabilities": {
             "helios_cmdb_version": env!("CARGO_PKG_VERSION"),
-            "tools": ["get_entity","query","traverse","upsert_entity","relate","history"],
+            "ana_compat": "0.7",
+            "supports_ack": true,
+            "supports_txn_id": true,
+            "tools": ["get_entity","query","traverse","search","cypher","history","facts","relations","upsert_entity","relate","list_types"],
         },
     });
     let subject = scheme.discovery(identity);

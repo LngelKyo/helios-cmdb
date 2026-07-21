@@ -141,6 +141,7 @@ pub fn parse_envelope(payload: &[u8]) -> Result<ParsedEnvelope, serde_json::Erro
     let parsed = match kind.as_str() {
         "query" => ParsedEnvelope::Query(serde_json::from_value(v)?),
         "reply" => ParsedEnvelope::Reply(serde_json::from_value(v)?),
+        "ack" => ParsedEnvelope::Ack(serde_json::from_value(v)?),
         "discovery" => ParsedEnvelope::Discovery(serde_json::from_value(v)?),
         "pulse" => ParsedEnvelope::Pulse(serde_json::from_value(v)?),
         "alert" => ParsedEnvelope::Alert(serde_json::from_value(v)?),
@@ -153,6 +154,7 @@ pub fn parse_envelope(payload: &[u8]) -> Result<ParsedEnvelope, serde_json::Erro
 pub enum ParsedEnvelope {
     Query(Query),
     Reply(Reply),
+    Ack(Ack),
     Discovery(Discovery),
     Pulse(Pulse),
     Alert(Alert),
