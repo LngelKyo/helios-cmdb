@@ -706,6 +706,29 @@ impl Store for PgStore {
             .collect())
     }
 
+    async fn text_search(
+        &self,
+        q: &str,
+        namespace: &str,
+        limit: u32,
+    ) -> StoreResult<Vec<Entity>> {
+        let rows = sqlx::query(
+            r#"SELECT id, namespace, type AS entity_type, name, attrs, tags,
+                      created_at, updated_at, version
+               FROM entities
+               WHERE namespace = $1 AND name % $2
+               ORDER BY similarity(name, $2) DESC
+               LIMIT $3"#,
+        )
+        .bind(namespace)
+        .bind(q)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(rows.iter().map(map_entity).collect())
+    }
+
     async fn cypher(&self, query: &str) -> StoreResult<Vec<Vec<String>>> {
         // Try AGE native first. With search_path=public,ag_catalog (set by
         // normalize_pg_url at connect time), AGE 1.7.0-rc0 handles vertex

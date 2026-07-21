@@ -150,6 +150,19 @@ pub trait Store: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Fuzzy text search using pg_trgm trigram similarity. Matches entity
+    /// names that share character subsequences with the query — works for
+    /// multi-word queries like "runner ci deploy" matching "ci-runner-01".
+    /// Backends without pg_trgm return empty Vec.
+    async fn text_search(
+        &self,
+        _q: &str,
+        _namespace: &str,
+        _limit: u32,
+    ) -> StoreResult<Vec<Entity>> {
+        Ok(Vec::new())
+    }
+
     /// Run a Cypher query against the backing graph (Apache AGE). Returns
     /// each row as a vector of raw agtype-encoded strings (caller decodes
     /// or just displays). Backends without a graph layer return an error.

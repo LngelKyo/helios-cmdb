@@ -489,6 +489,8 @@ async fn search(
 ) -> Result<Json<Value>, AppError> {
     let namespace = q.namespace.as_deref().unwrap_or("cc.fleet");
     let limit = q.limit.unwrap_or(20);
+
+    // Tier 1: semantic
     let hits = s.store.vector_search(&q.q, namespace, limit).await.map_err(AppError::store)?;
     if !hits.is_empty() {
         return Ok(Json(json!({
@@ -497,17 +499,35 @@ async fn search(
             "mode": "semantic",
         })));
     }
-    let filter = QueryFilter::new().in_namespace(namespace).with_limit(limit);
+    // Tier 2: fuzzy (pg_trgm)
+    let fuzzy = s.store.text_search(&q.q, namespace, limit).await.map_err(AppError::store)?;
+    if !fuzzy.is_empty() {
+        return Ok(Json(json!({
+            "results": fuzzy,
+            "count": fuzzy.len(),
+            "mode": "fuzzy",
+        })));
+    }
+    // Tier 3: tokenized substring (name + type + attrs text)
+    let filter = QueryFilter::new().in_namespace(namespace).with_limit(200);
     let entities = s.store.query_entities(filter).await.map_err(AppError::store)?;
+    let tokens: Vec<String> = q.q.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
     let q_lower = q.q.to_lowercase();
-    let filtered: Vec<_> = entities
-        .into_iter()
-        .filter(|e| e.name.to_lowercase().contains(&q_lower))
-        .collect();
+    let filtered: Vec<_> = entities.into_iter().filter(|e| {
+        let name_lower = e.name.to_lowercase();
+        let type_lower = e.entity_type.to_lowercase();
+        let attrs_lower = e.attrs.to_string().to_lowercase();
+        if tokens.is_empty() {
+            return name_lower.contains(&q_lower) || type_lower.contains(&q_lower);
+        }
+        tokens.iter().any(|t| {
+            name_lower.contains(t) || type_lower.contains(t) || attrs_lower.contains(t)
+        })
+    }).take(limit as usize).collect();
     Ok(Json(json!({
         "results": filtered,
         "count": filtered.len(),
-        "mode": "substring",
+        "mode": "tokenized",
     })))
 }
 

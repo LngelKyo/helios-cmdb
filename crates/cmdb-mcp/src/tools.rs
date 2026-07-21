@@ -124,7 +124,8 @@ impl McpServer {
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                     .unwrap_or_default();
-                let source = Source::new_cli(&actor);
+                let caller = args.get("caller").and_then(|v| v.as_str()).unwrap_or(&actor);
+                let source = Source::new_agent(caller);
                 let input = EntityInput::new(namespace, entity_type, entity_name)
                     .with_attrs(attrs)
                     .with_tags(tags);
@@ -138,7 +139,8 @@ impl McpServer {
                 let value = args.get("value").cloned().unwrap_or(Value::Null);
                 let confidence = args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
                 let ttl_seconds = args.get("ttl_seconds").and_then(|v| v.as_i64());
-                let mut source = Source::new_agent(&actor);
+                let caller = args.get("caller").and_then(|v| v.as_str()).unwrap_or(&actor);
+                let mut source = Source::new_agent(caller);
                 source.confidence = confidence;
                 source.ttl_seconds = ttl_seconds;
                 let input = FactInput {
@@ -284,8 +286,7 @@ impl McpServer {
     }
 
     async fn tool_search(&self, namespace: &str, q: &str, limit: u32) -> Result<Value, String> {
-        // Try pgvector semantic search first; falls back to substring if no
-        // embedder configured or store returns nothing.
+        // Tier 1: pgvector semantic search.
         let hits = self
             .store
             .vector_search(q, namespace, limit)
@@ -302,23 +303,58 @@ impl McpServer {
                 "mode": "semantic",
             }));
         }
-        // Substring fallback.
-        let filter = QueryFilter::new().in_namespace(namespace).with_limit(limit);
+
+        // Tier 2: pg_trgm fuzzy similarity.
+        let fuzzy = self
+            .store
+            .text_search(q, namespace, limit)
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap_or_default();
+        if !fuzzy.is_empty() {
+            return Ok(json!({
+                "results": fuzzy,
+                "count": fuzzy.len(),
+                "mode": "fuzzy",
+            }));
+        }
+
+        // Tier 3: tokenized substring (split query into words, match any in name/type/attrs).
+        let filter = QueryFilter::new().in_namespace(namespace).with_limit(200);
         let all = self.store.query_entities(filter).await.map_err(|e| e.to_string())?;
-        let q_lower = q.to_lowercase();
-        let filtered: Vec<_> = all
-            .into_iter()
-            .filter(|e| {
+        let tokens: Vec<String> = q
+            .to_lowercase()
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        let filtered: Vec<_> = if tokens.is_empty() {
+            all.into_iter().filter(|e| {
+                let q_lower = q.to_lowercase();
                 e.name.to_lowercase().contains(&q_lower)
                     || e.entity_type.to_lowercase().contains(&q_lower)
-                    || e.tags.iter().any(|t| t.to_lowercase().contains(&q_lower))
-            })
-            .collect();
+            }).collect()
+        } else {
+            all.into_iter().filter(|e| {
+                let name_lower = e.name.to_lowercase();
+                let type_lower = e.entity_type.to_lowercase();
+                let attrs_lower = e.attrs.to_string().to_lowercase();
+                let name_words: Vec<&str> = name_lower
+                    .split(|c: char| !c.is_alphanumeric())
+                    .collect();
+                tokens.iter().any(|t| {
+                    name_lower.contains(t)
+                        || type_lower.contains(t)
+                        || attrs_lower.contains(t)
+                        || e.tags.iter().any(|tag| tag.to_lowercase().contains(t))
+                        || name_words.iter().any(|w| w == t)
+                })
+            }).collect()
+        };
+        let filtered: Vec<_> = filtered.into_iter().take(limit as usize).collect();
         Ok(json!({
             "results": filtered,
             "count": filtered.len(),
-            "mode": "substring",
-            "hint": "set CMDB_OLLAMA_URL or OPENAI_API_KEY for semantic search",
+            "mode": "tokenized",
         }))
     }
 
@@ -407,18 +443,18 @@ pub static TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "upsert_entity",
-        description: "Insert or update an entity. Source defaults to the MCP actor.",
-        input_schema: r#"{"type":"object","required":["type","name"],"properties":{"namespace":{"type":"string"},"type":{"type":"string"},"name":{"type":"string"},"attrs":{"type":"object"},"tags":{"type":"array","items":{"type":"string"}}}}"#,
+        description: "Insert or update an entity. Source defaults to the MCP actor. Pass 'caller' to attribute the write to a specific agent/session.",
+        input_schema: r#"{"type":"object","required":["type","name"],"properties":{"namespace":{"type":"string"},"type":{"type":"string"},"name":{"type":"string"},"attrs":{"type":"object"},"tags":{"type":"array","items":{"type":"string"}},"caller":{"type":"string","description":"Optional identity for provenance, e.g. 'agent:hermes:session-abc'"}}}"#,
     },
     ToolDef {
         name: "upsert_fact",
-        description: "Add a versioned observation about an entity. Confidence defaults to 0.7 (agent source).",
-        input_schema: r#"{"type":"object","required":["entity","key","value"],"properties":{"namespace":{"type":"string"},"entity":{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string"},"name":{"type":"string"}}},"key":{"type":"string"},"value":{},"confidence":{"type":"number","default":0.7},"ttl_seconds":{"type":"integer"}}}"#,
+        description: "Add a versioned observation about an entity. Pass 'caller' for provenance.",
+        input_schema: r#"{"type":"object","required":["entity","key","value"],"properties":{"namespace":{"type":"string"},"entity":{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string"},"name":{"type":"string"}}},"key":{"type":"string"},"value":{},"confidence":{"type":"number","default":0.7},"ttl_seconds":{"type":"integer"},"caller":{"type":"string","description":"Optional identity for provenance"}}"#,
     },
     ToolDef {
         name: "relate",
         description: "Create a directed relation between two entities.",
-        input_schema: r#"{"type":"object","required":["from","to","type"],"properties":{"namespace":{"type":"string"},"from":{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string"},"name":{"type":"string"}}},"to":{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string"},"name":{"type":"string"}}},"type":{"type":"string"},"props":{"type":"object"}}}"#,
+        input_schema: r#"{"type":"object","required":["from","to","type"],"properties":{"namespace":{"type":"string"},"from":{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string"},"name":{"type":"string"}}},"to":{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string"},"name":{"type":"string"}}},"type":{"type":"string"},"props":{"type":"object"},"caller":{"type":"string","description":"Optional identity for provenance"}}"#,
     },
     ToolDef {
         name: "unrelate",
