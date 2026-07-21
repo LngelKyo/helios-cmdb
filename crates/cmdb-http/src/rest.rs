@@ -240,6 +240,7 @@ struct EntityQuery {
     tags: Option<String>,
     namespace: Option<String>,
     limit: Option<u32>,
+    offset: Option<u32>,
 }
 
 async fn get_entity(

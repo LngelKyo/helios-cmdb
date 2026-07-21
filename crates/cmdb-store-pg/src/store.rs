@@ -201,11 +201,10 @@ impl PgStore {
     pub async fn connect(url: &str) -> Result<Self> {
         let url = normalize_pg_url(url);
         let pool = PgPoolOptions::new()
-            .max_connections(8)
+            .max_connections(16)
+            .min_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(10))
             .after_connect(|conn, _| Box::pin(async move {
-                // AGE 1.6.0 on PG16 requires `LOAD 'age'` per session
-                // (shared_preload_libraries not set on the k3s PG). This
-                // callback runs on every new pooled connection.
                 sqlx::query("LOAD 'age'").execute(&mut *conn).await?;
                 sqlx::query("SET search_path = public, ag_catalog")
                     .execute(&mut *conn)
@@ -298,21 +297,33 @@ impl PgStore {
         let ns = Self::cypher_escape(&e.namespace);
         let typ = Self::cypher_escape(&e.entity_type);
         let name = Self::cypher_escape(&e.name);
-        let cypher = format!(
-            "MERGE (n:Entity {{entity_id: '{id}'}}) \
-             SET n.namespace = '{ns}', n.type = '{typ}', n.name = '{name}'"
-        );
-        if let Err(err) = self.age_query_raw(&cypher).await {
-            tracing::warn!(error = %err, entity_id = %e.id, "AGE sync entity failed");
-        }
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let cypher = format!(
+                "MERGE (n:Entity {{entity_id: '{id}'}}) \
+                 SET n.namespace = '{ns}', n.type = '{typ}', n.name = '{name}'"
+            );
+            let sql = format!(
+                "SELECT (result)::text AS cell FROM ag_catalog.cypher('{GRAPH_NAME}', $$ {cypher} $$) AS __t(result ag_catalog.agtype);"
+            );
+            if let Err(err) = sqlx::query(&sql).fetch_all(&pool).await {
+                tracing::warn!(error = %err, "AGE sync entity failed");
+            }
+        });
     }
 
     async fn age_delete_entity(&self, id: EntityId) {
         let id_s = Self::cypher_escape(&id.as_uuid().to_string());
-        let cypher = format!("MATCH (n:Entity {{entity_id: '{id_s}'}}) DETACH DELETE n");
-        if let Err(err) = self.age_query_raw(&cypher).await {
-            tracing::info!(error = %err, "AGE delete entity (graph may be empty)");
-        }
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let cypher = format!("MATCH (n:Entity {{entity_id: '{id_s}'}}) DETACH DELETE n");
+            let sql = format!(
+                "SELECT (result)::text AS cell FROM ag_catalog.cypher('{GRAPH_NAME}', $$ {cypher} $$) AS __t(result ag_catalog.agtype);"
+            );
+            if let Err(err) = sqlx::query(&sql).fetch_all(&pool).await {
+                tracing::info!(error = %err, "AGE delete entity (graph may be empty)");
+            }
+        });
     }
 
     async fn age_sync_relation(&self, r: &Relation) {
@@ -321,53 +332,69 @@ impl PgStore {
         let rid = Self::cypher_escape(&r.id.as_uuid().to_string());
         let ns = Self::cypher_escape(&r.namespace);
         let rt = Self::cypher_escape(&r.relation_type);
-        let cypher = format!(
-            "MATCH (a:Entity {{entity_id: '{from}'}}), (b:Entity {{entity_id: '{to}'}}) \
-             MERGE (a)-[rel:Relation {{relation_id: '{rid}'}}]->(b) \
-             SET rel.namespace = '{ns}', rel.type = '{rt}'"
-        );
-        if let Err(err) = self.age_query_raw(&cypher).await {
-            tracing::warn!(error = %err, relation_id = %r.id, "AGE sync relation failed");
-        }
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let cypher = format!(
+                "MATCH (a:Entity {{entity_id: '{from}'}}), (b:Entity {{entity_id: '{to}'}}) \
+                 MERGE (a)-[rel:Relation {{relation_id: '{rid}'}}]->(b) \
+                 SET rel.namespace = '{ns}', rel.type = '{rt}'"
+            );
+            let sql = format!(
+                "SELECT (result)::text AS cell FROM ag_catalog.cypher('{GRAPH_NAME}', $$ {cypher} $$) AS __t(result ag_catalog.agtype);"
+            );
+            if let Err(err) = sqlx::query(&sql).fetch_all(&pool).await {
+                tracing::warn!(error = %err, "AGE sync relation failed");
+            }
+        });
     }
 
     async fn age_delete_relation(&self, id: RelationId) {
         let id_s = Self::cypher_escape(&id.as_uuid().to_string());
-        let cypher = format!("MATCH ()-[rel:Relation {{relation_id: '{id_s}'}}]->() DELETE rel");
-        if let Err(err) = self.age_query_raw(&cypher).await {
-            tracing::info!(error = %err, "AGE delete relation (graph may be empty)");
-        }
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let cypher = format!("MATCH ()-[rel:Relation {{relation_id: '{id_s}'}}]->() DELETE rel");
+            let sql = format!(
+                "SELECT (result)::text AS cell FROM ag_catalog.cypher('{GRAPH_NAME}', $$ {cypher} $$) AS __t(result ag_catalog.agtype);"
+            );
+            if let Err(err) = sqlx::query(&sql).fetch_all(&pool).await {
+                tracing::info!(error = %err, "AGE delete relation (graph may be empty)");
+            }
+        });
     }
 
-    async fn upsert_embedding(&self, entity_id: EntityId, text: &str) {
+    async fn upsert_embedding(&self, entity_id: EntityId, text: String) {
         let Some(embedder) = &self.embedder else {
             return;
         };
-        match embedder.embed(text).await {
-            Ok(vec) => {
-                let pv = pgvector::Vector::from(vec);
-                let sql = r#"
-                    INSERT INTO entity_embeddings (entity_id, embedding, model)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (entity_id) DO UPDATE
-                      SET embedding = EXCLUDED.embedding,
-                          model = EXCLUDED.model,
-                          embedded_at = NOW()
-                "#;
-                if let Err(e) = sqlx::query(sql)
-                    .bind(entity_id.as_uuid())
-                    .bind(pv)
-                    .bind(embedder.name())
-                    .execute(&self.pool)
-                    .await
-                {
-                    tracing::warn!(error = %e, "embedding upsert failed");
+        let embedder = embedder.clone();
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            match embedder.embed(&text).await {
+                Ok(vec) => {
+                    let pv = pgvector::Vector::from(vec);
+                    let sql = r#"
+                        INSERT INTO entity_embeddings (entity_id, embedding, model)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (entity_id) DO UPDATE
+                          SET embedding = EXCLUDED.embedding,
+                              model = EXCLUDED.model,
+                              embedded_at = NOW()
+                    "#;
+                    if let Err(e) = sqlx::query(sql)
+                        .bind(entity_id.as_uuid())
+                        .bind(pv)
+                        .bind(embedder.name())
+                        .execute(&pool)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "embedding upsert failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "embedding failed; entity will not be searchable via vector");
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "embedding failed; entity will not be searchable via vector");
-            }
-        }
+        });
     }
 }
 
@@ -468,11 +495,11 @@ impl Store for PgStore {
             .map_err(pg_err)?;
         let entity = map_entity(&row);
 
-        // Compute + persist embedding (no-op if embedder is unconfigured).
+        // Compute + persist embedding (async, fire-and-forget).
         let text = cmdb_embedding::text_for_entity(&entity);
-        self.upsert_embedding(entity.id, &text).await;
+        self.upsert_embedding(entity.id, text).await;
 
-        // Dual-write to Apache AGE graph (best-effort).
+        // Dual-write to Apache AGE graph (async, fire-and-forget).
         self.age_sync_entity(&entity).await;
 
         self.record_change(ChangeRecord {
@@ -519,47 +546,29 @@ impl Store for PgStore {
 
 #[allow(unused_assignments)]
     async fn query_entities(&self, filter: QueryFilter) -> StoreResult<Vec<Entity>> {
-        let mut sql = String::from(
+        use sqlx::QueryBuilder;
+        let mut qb = QueryBuilder::new(
             r#"SELECT id, namespace, type AS entity_type, name, attrs, tags,
                       created_at, updated_at, version
-               FROM entities WHERE 1=1"#,
+               FROM entities WHERE 1=1"#
         );
-        let mut idx = 1usize;
-        if filter.namespace.is_some() {
-            sql.push_str(&format!(" AND namespace = ${idx}"));
-            idx += 1;
-        }
-        if filter.entity_type.is_some() {
-            sql.push_str(&format!(" AND type = ${idx}"));
-            idx += 1;
-        }
-        if filter.name_prefix.is_some() {
-            sql.push_str(&format!(" AND name LIKE ${idx}"));
-            idx += 1;
-        }
-        if !filter.tags.is_empty() {
-            sql.push_str(&format!(" AND tags @> ${idx}"));
-            idx += 1;
-        }
-        sql.push_str(" ORDER BY created_at");
-        if let Some(limit) = filter.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
-        }
-
-        let mut q = sqlx::query(&sql);
         if let Some(ns) = &filter.namespace {
-            q = q.bind(ns);
+            qb.push(" AND namespace = ").push_bind(ns.clone());
         }
         if let Some(t) = &filter.entity_type {
-            q = q.bind(t);
+            qb.push(" AND type = ").push_bind(t.clone());
         }
         if let Some(p) = &filter.name_prefix {
-            q = q.bind(format!("{}%", p));
+            qb.push(" AND name LIKE ").push_bind(format!("{}%", p));
         }
         if !filter.tags.is_empty() {
-            q = q.bind(filter.tags);
+            qb.push(" AND tags @> ").push_bind(filter.tags.clone());
         }
-        let rows = q.fetch_all(&self.pool).await.map_err(pg_err)?;
+        qb.push(" ORDER BY created_at");
+        if let Some(limit) = filter.limit {
+            qb.push(" LIMIT ").push_bind(limit as i64);
+        }
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(pg_err)?;
         Ok(rows.iter().map(map_entity).collect())
     }
 

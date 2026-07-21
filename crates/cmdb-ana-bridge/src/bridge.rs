@@ -275,6 +275,7 @@ async fn handle_query(
         reply_for: Some(msg.subject.to_string()),
         in_reply_to: env.request_id.clone(),
         request_id: env.request_id,
+        txn_id: env.txn_id.clone(),
         data,
         note: Some("helios-cmdb".into()),
         to: Some(env.base.from.clone()),

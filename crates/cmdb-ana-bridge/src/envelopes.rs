@@ -39,6 +39,11 @@ pub struct Query {
     pub reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// v0.6.2: TxnManager transaction id. When the caller uses
+    /// query_and_wait(use_txn=True), this field carries the KV txn id so
+    /// the responder can echo it back in the Reply for correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,12 +56,33 @@ pub struct Reply {
     pub in_reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// v0.6.2: echo the caller's txn_id back so the caller's TxnManager
+    /// can transition RECEIVED → COMMITTED.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn_id: Option<String>,
     #[serde(default)]
     pub data: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+}
+
+/// v0.6.2: Ack envelope — "I saw your message and I'm alive".
+/// Mirrors ana's pydantic Ack model. CMDB sends this before running
+/// long queries so the caller's query_and_wait(accept_ack=True) doesn't
+/// timeout while the CMDB is computing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ack {
+    #[serde(flatten)]
+    pub base: EnvelopeBase,
+    pub ack_for: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_subjects: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default = "default_true")]
+    pub alive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +129,10 @@ pub struct Alert {
 
 fn default_level() -> String {
     "info".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn parse_envelope(payload: &[u8]) -> Result<ParsedEnvelope, serde_json::Error> {
